@@ -20,6 +20,7 @@
 #include "gloo/allreduce.h"
 #include "gloo/alltoallv.h"
 #include "gloo/broadcast.h"
+#include "gloo/reduce_scatter.h"
 #include "gloo/math.h"
 #include "gloo/types.h"
 
@@ -63,12 +64,24 @@ GlooAlgorithms<T>::GlooAlgorithms(GlooContext* gloo_context)
     : gloo_context_(gloo_context) {}
 
 template <typename T>
-void GlooAlgorithms<T>::Allreduce(void* buffer_data, int num_elements) {
+void GlooAlgorithms<T>::Allreduce(void* buffer_data, int num_elements,
+                                  ReduceOp reduce_op) {
   gloo::AllreduceOptions opts(gloo_context_->ctx);
   opts.setOutput<T>(static_cast<T*>(buffer_data), (size_t) num_elements);
 
-  void (*func)(void*, const void*, const void*, size_t) = &::gloo::sum<T>;
-  opts.setReduceFunction(gloo::AllreduceOptions::Func(func));
+  if (reduce_op == ReduceOp::SUM) {
+    void (*func)(void*, const void*, const void*, size_t) = &::gloo::sum<T>;
+    opts.setReduceFunction(gloo::AllreduceOptions::Func(func));
+   } else if (reduce_op == ReduceOp::MIN) {
+    void (*func)(void*, const void*, const void*, size_t) = &::gloo::min<T>;
+    opts.setReduceFunction(gloo::AllreduceOptions::Func(func));
+   } else if (reduce_op == ReduceOp::MAX) {
+    void (*func)(void*, const void*, const void*, size_t) = &::gloo::max<T>;
+    opts.setReduceFunction(gloo::AllreduceOptions::Func(func));
+   } else if (reduce_op == ReduceOp::PRODUCT) {
+    void (*func)(void*, const void*, const void*, size_t) = &::gloo::product<T>;
+    opts.setReduceFunction(gloo::AllreduceOptions::Func(func));
+   }
 
   gloo::allreduce(opts);
 }
@@ -108,6 +121,24 @@ void GlooAlgorithms<T>::Alltoall(void* buffer_data, void* buffer_out,
   gloo::alltoallv(opts);
 }
 
+template <>
+void GlooAlgorithms<bool>::Reducescatter(void* buffer_data,
+                                         std::vector<int>& recvcounts) {
+  // Need to add this specialization for T=bool because
+  // gloo::ReduceScatterHalvingDoubling does not support vector<bool>
+  throw std::logic_error("GlooReducescatter does not support bool data.");
+}
+
+template <typename T>
+void GlooAlgorithms<T>::Reducescatter(void* buffer_data,
+                                      std::vector<int>& recvcounts) {
+  std::vector<T*> ptrs{reinterpret_cast<T*>(buffer_data)};
+  int num_elements = std::accumulate(recvcounts.begin(), recvcounts.end(), 0);
+  gloo::ReduceScatterHalvingDoubling<T> rs_hd(gloo_context_->ctx, ptrs,
+                                              num_elements, recvcounts);
+  rs_hd.run();
+}
+
 template <typename T> int GlooAlgorithms<T>::ElementSize() const {
   return sizeof(T);
 }
@@ -123,6 +154,26 @@ Status GlooAllreduce::Execute(std::vector<TensorTableEntry>& entries,
   auto& process_set =
       global_state_->process_set_table.Get(first_entry.process_set_id);
   auto& gloo_context = process_set.gloo_context;
+
+  ReduceOp glooOp = ReduceOp::SUM;
+  double prescale_factor = response.prescale_factor();
+  double postscale_factor = response.postscale_factor();
+
+  if (response.reduce_op() == ReduceOp::AVERAGE) {
+    glooOp = ReduceOp::SUM;
+    // Averaging happens via postscale_factor
+    postscale_factor /= process_set.controller->GetSize();
+  } else if (response.reduce_op() == ReduceOp::SUM) {
+    glooOp = ReduceOp::SUM;
+  } else if (response.reduce_op() == ReduceOp::MIN) {
+    glooOp = ReduceOp::MIN;
+  } else if (response.reduce_op() == ReduceOp::MAX) {
+    glooOp = ReduceOp::MAX;
+  } else if (response.reduce_op() == ReduceOp::PRODUCT) {
+    glooOp = ReduceOp::PRODUCT;
+  } else {
+    throw std::logic_error("Reduction op type not supported.");
+  }
 
   const void* fused_input_data;
   void* buffer_data;
@@ -142,21 +193,21 @@ Status GlooAllreduce::Execute(std::vector<TensorTableEntry>& entries,
     fused_input_data = buffer_data;
   }
 
-  if (response.prescale_factor() != 1.0) {
+  if (prescale_factor != 1.0) {
     // Execute prescaling op
-    ScaleBuffer(response.prescale_factor(), entries, fused_input_data, buffer_data, num_elements);
+    ScaleBuffer(prescale_factor, entries, fused_input_data, buffer_data, num_elements);
   }
 
   // Do allreduce.
   timeline.ActivityStartAll(entries, GLOO_ALLREDUCE);
   std::unique_ptr<IGlooAlgorithms> gloo_algos(
       GetAlgorithmsForType(first_entry.tensor->dtype(), &gloo_context));
-  gloo_algos->Allreduce(buffer_data, num_elements);
+  gloo_algos->Allreduce(buffer_data, num_elements, glooOp);
   timeline.ActivityEndAll(entries);
 
-  if (response.postscale_factor() != 1.0) {
+  if (postscale_factor != 1.0) {
     // Execute postscaling op
-    ScaleBuffer(response.postscale_factor(), entries, buffer_data, buffer_data, num_elements);
+    ScaleBuffer(postscale_factor, entries, buffer_data, buffer_data, num_elements);
   }
 
   // Copy memory out of the fusion buffer.
@@ -213,8 +264,7 @@ Status GlooAllgather::Execute(std::vector<TensorTableEntry>& entries,
 
 
   timeline.ActivityStartAll(entries, ALLOCATE_OUTPUT);
-  Status status =
-      AllocateOutput(entries, response, entry_component_sizes, recvcounts);
+  Status status = AllocateOutput(entries, response, entry_component_sizes);
   if (!status.ok()) {
     /* Cleanup */
     for (size_t ec = 0; ec < entries.size(); ++ec) {
@@ -229,9 +279,10 @@ Status GlooAllgather::Execute(std::vector<TensorTableEntry>& entries,
   }
   timeline.ActivityEndAll(entries);
 
+  SetRecvcounts(entry_component_sizes, entries.size(), global_size, recvcounts);
   SetDisplacements(recvcounts, displcmnts, global_size);
-  SetEntryComponentOffsets(entries, entry_component_sizes, recvcounts,
-                           entry_component_offsets);
+  SetEntryComponentOffsets(entry_component_sizes, recvcounts, entries.size(),
+                           global_size, entry_component_offsets);
 
   std::unique_ptr<IGlooAlgorithms> gloo_algos(
       GetAlgorithmsForType(first_entry.tensor->dtype(), &gloo_context));
@@ -351,6 +402,95 @@ bool GlooAlltoall::Enabled(const ParameterManager& param_manager,
                            const std::vector<TensorTableEntry>& entries,
                            const Response& response) const {
   return true;
+}
+
+GlooReducescatter::GlooReducescatter(HorovodGlobalState* global_state)
+    : ReducescatterOp(global_state) {}
+
+Status GlooReducescatter::Execute(std::vector<TensorTableEntry>& entries,
+                                  const Response& response) {
+  WaitForData(entries);
+
+  assert(!entries.empty());
+  auto& first_entry = entries[0];
+  auto& process_set =
+      global_state_->process_set_table.Get(first_entry.process_set_id);
+  auto& gloo_context = process_set.gloo_context;
+  auto& timeline = global_state_->timeline;
+
+  double prescale_factor = response.prescale_factor();
+  double postscale_factor = response.postscale_factor();
+
+  void* buffer_data = nullptr;
+  int num_elements = (int)NumElements(entries);
+
+  int global_size = process_set.controller->GetSize();
+  auto output_shapes = ComputeOutputShapes(entries, global_size);
+  std::vector<int> recvcounts = ComputeReceiveCounts(output_shapes);
+
+  std::unique_ptr<IGlooAlgorithms> gloo_algos(
+      GetAlgorithmsForType(first_entry.tensor->dtype(), &gloo_context));
+  int element_size = gloo_algos->ElementSize();
+
+  // Copy memory into the fusion buffer.
+  timeline.ActivityStartAll(entries, MEMCPY_IN_FUSION_BUFFER);
+  if (entries.size() > 1) {
+    size_t buffer_len;
+    MemcpyInFusionBuffer(entries, output_shapes, element_size, buffer_data,
+                         buffer_len);
+  } else {
+    // Allocating a temp buffer because the Reducescatter will be performed
+    // in place and the output tensor will be smaller than the input.
+    buffer_data = new uint8_t[first_entry.tensor->size()];
+    std::memcpy(buffer_data, first_entry.tensor->data(),
+                first_entry.tensor->size());
+  }
+  if (prescale_factor != 1.0) {
+    // Execute prescaling op
+    ScaleBuffer(prescale_factor, entries, buffer_data, buffer_data,
+                num_elements);
+  }
+  timeline.ActivityEndAll(entries);
+
+  // Call Gloo Reducescatter API
+  timeline.ActivityStartAll(entries, GLOO_REDUCESCATTER);
+  gloo_algos->Reducescatter(buffer_data, recvcounts);
+  timeline.ActivityEndAll(entries);
+
+  // Copy memory out of the fusion buffer. Optionally scale outputs in place.
+  timeline.ActivityStartAll(entries, MEMCPY_OUT_FUSION_BUFFER);
+  if (entries.size() > 1) {
+    MemcpyOutFusionBuffer(buffer_data, entries);
+  } else {
+    void* output_pointer = const_cast<void*>(first_entry.output->data());
+    std::memcpy(output_pointer, buffer_data, first_entry.output->size());
+    delete[] reinterpret_cast<uint8_t*>(buffer_data);
+  }
+  timeline.ActivityEndAll(entries);
+  if (postscale_factor != 1.0) {
+    // Execute postscaling ops
+    for (auto& e : entries) {
+      ScaleBuffer(postscale_factor, entries, e.output->data(),
+                  const_cast<void*>(e.output->data()),
+                  e.output->shape().num_elements());
+    }
+  }
+
+  return Status::OK();
+}
+
+bool GlooReducescatter::Enabled(const ParameterManager& param_manager,
+                                const std::vector<TensorTableEntry>& entries,
+                                const Response& response) const {
+#ifdef __linux__
+  return true;
+#else
+  // On MacOS we cannot use the TCP backend of Gloo. The
+  // ReduceScatterHalvingDoubling algorithm does not work with the libuv backend
+  // that is available because functions like Pair::createSendBuffer() are not
+  // implemented. https://github.com/facebookincubator/gloo/issues/257
+  return false;
+#endif
 }
 
 } // namespace common

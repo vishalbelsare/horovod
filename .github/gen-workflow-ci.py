@@ -13,7 +13,9 @@
 # limitations under the License.
 # ==============================================================================
 
+import os
 import re
+import sys
 from typing import List, Dict, Set
 
 import yaml
@@ -29,12 +31,15 @@ def main():
     path = pathlib.Path(__file__).parent
     script = path.joinpath('..', '.buildkite', 'gen-pipeline.sh').absolute()
     env = dict(
+        PATH=os.environ.get('PATH', ''),
         PIPELINE_MODE='FULL',
         BUILDKITE_PIPELINE_SLUG='horovod',
         BUILDKITE_PIPELINE_DEFAULT_BRANCH='master',
         BUILDKITE_BRANCH='master'
     )
-    proc = subprocess.run([script], env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, encoding='utf-8')
+    proc = subprocess.run([script], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8')
+    if proc.stderr:
+        print(proc.stderr, file=sys.stderr)
     if proc.returncode:
         raise RuntimeError(f'Script exited with code {proc.returncode}: {script}')
 
@@ -42,18 +47,29 @@ def main():
     pipeline = yaml.load(proc.stdout, Loader=Loader)
     steps = pipeline.get('steps', [])
 
-    images = [plugin['docker-compose#v3.5.0']['build']
+    docker_compose_plugins = {plugin_name
+                              for step in steps if isinstance(step, dict) and 'label' in step
+                              and step['label'].startswith(':docker: Build ')
+                              for plugins in step['plugins']
+                              for plugin_name in plugins.keys() if plugin_name.startswith('docker-compose#')}
+    if len(docker_compose_plugins) == 0:
+        raise RuntimeError('No docker-compose plugin found')
+    if len(docker_compose_plugins) > 1:
+        raise RuntimeError('Multiple docker-compose plugins found')
+
+    docker_compose_plugin = list(docker_compose_plugins)[0]
+    images = [plugin[docker_compose_plugin]['build']
               for step in steps if isinstance(step, dict) and 'label' in step
                                 and step['label'].startswith(':docker: Build ')
-              for plugin in step['plugins'] if 'docker-compose#v3.5.0' in plugin]
+              for plugin in step['plugins'] if docker_compose_plugin in plugin]
 
     cpu_tests = [(re.sub(r' \(test-.*', '', re.sub(':[^:]*: ', '', step['label'])),
                   step['command'],
                   step['timeout_in_minutes'],
-                  plugin['docker-compose#v3.5.0']['run'])
+                  plugin[docker_compose_plugin]['run'])
                  for step in steps if isinstance(step, dict) and 'label' in step and 'command' in step
                  and not step['label'].startswith(':docker: Build ') and '-cpu-' in step['label']
-                 for plugin in step['plugins'] if 'docker-compose#v3.5.0' in plugin]
+                 for plugin in step['plugins'] if docker_compose_plugin in plugin]
 
     # we need to distinguish the two oneccl variants of some tests
     cpu_tests = [(label + (' [ONECCL OFI]' if 'mpirun_command_ofi' in command else (' [ONECCL MPI]' if 'mpirun_command_mpi' in command else '')),
@@ -112,17 +128,20 @@ def main():
                 f'name: CI\n'
                 f'\n'
                 f'on:\n'
-                f'  schedule:\n'
-                f'    # run a build on master (this does not publish test results or cancel concurrent builds)\n'
-                f'    - cron: \'0 10 * * *\' # everyday at 10am\n'
+                f'  #schedule:\n'
+                f'  #  # run a build on master (this does not publish test results or cancel concurrent builds)\n'
+                f'  #  - cron: \'0 10 * * *\' # everyday at 10am\n'
                 f'  push:\n'
-                f'    # only consider push to master and tags\n'
+                f'    # only consider push to master, hotfix-branches, and tags\n'
                 f'    # otherwise modify job.config.outputs.push\n'
-                f'    branches: [ master ]\n'
+                f'    branches: [ \'master\', \'hotfix-*\' ]\n'
                 f'    tags: [ \'v*.*.*\' ]\n'
                 f'  pull_request:\n'
                 f'    # only consider pull requests into master\n'
                 f'    branches: [ master ]\n'
+                f'  workflow_dispatch:\n'
+                f'\n'
+                 'permissions: {}\n'
                 f'\n'
                 f'concurrency:\n'
                 f'  # This controls which concurrent builds to cancel:\n'
@@ -148,23 +167,38 @@ def main():
 
     def jobs(*jobs: str) -> str:
         return 'jobs:\n' \
-               '  debug:\n' \
-               '    runs-on: ubuntu-latest\n' \
-               '    steps:\n' \
-               '    - name: Debug Action\n' \
-               '      uses: hmarr/debug-action@v1.0.0\n' \
-               '    - name: Debug Concurrency\n' \
-               '      run: echo "ci-${{ github.event_name }}-${{ github.ref }}-${{ github.head_ref || github.sha }}"\n' \
-               '\n' \
                '  event_file:\n' \
                '    name: "Event File"\n' \
                '    runs-on: ubuntu-latest\n' \
                '    steps:\n' \
                '    - name: Upload\n' \
-               '      uses: actions/upload-artifact@v2\n' \
+               '      uses: actions/upload-artifact@v4\n' \
                '      with:\n' \
                '        name: Event File\n' \
                '        path: ${{ github.event_path }}\n' \
+               '\n' + \
+               '  setup-py:\n' \
+               '    name: "setup.py"\n' \
+               '    runs-on: ubuntu-latest\n' \
+               '    steps:\n' \
+               '      - name: Checkout\n' \
+               '        uses: actions/checkout@v4\n' \
+               '      - name: Setup Python\n' \
+               '        uses: actions/setup-python@v5\n' \
+               '        with:\n' \
+               '          python-version: 3.8\n' \
+               '      - name: Test setup.py\n' \
+               '        env:\n' \
+               '          HOROVOD_WITHOUT_TENSORFLOW: 1\n' \
+               '          HOROVOD_WITHOUT_PYTORCH: 1\n' \
+               '          HOROVOD_WITHOUT_MXNET: 1\n' \
+               '          HOROVOD_WITHOUT_GLOO: 1\n' \
+               '          HOROVOD_WITHOUT_MPI: 1\n' \
+               '        run: |\n' \
+               '          python -m pip install --upgrade pip\n' \
+               '          python -m pip install setuptools wheel\n' \
+               '          python setup.py sdist\n' \
+               '          pip -v install dist/horovod-*.tar.gz\n' \
                '\n' + \
                '\n'.join(jobs)
 
@@ -181,9 +215,9 @@ def main():
                 f'\n'
                 f'    steps:\n'
                 f'      - name: Checkout\n'
-                f'        uses: actions/checkout@v2\n'
+                f'        uses: actions/checkout@v4\n'
                 f'      - name: Setup Python\n'
-                f'        uses: actions/setup-python@v2\n'
+                f'        uses: actions/setup-python@v5\n'
                 f'        with:\n'
                 f'          python-version: 3.8\n'
                 f'      - name: Pip install dependencies\n'
@@ -211,23 +245,24 @@ def main():
                 f'            if [[ -z "$changes" ]]\n'
                 f'            then\n'
                 f'              echo "No code changes, no need to build and test"\n'
-                f'              echo "::set-output name=needed::false"\n'
+                f'              echo "needed=false" >> $GITHUB_OUTPUT\n'
                 f'            else\n'
                 f'              echo "Code changes, we need to build and test:"\n'
                 f'              echo "$changes"\n'
-                f'              echo "::set-output name=needed::true"\n'
+                f'              echo "needed=true" >> $GITHUB_OUTPUT\n'
                 f'            fi\n'
                 f'          else\n'
                 f'            echo "This is not part of a pull request, we need to build and test"\n'
-                f'            echo "::set-output name=needed::true"\n'
+                f'            echo "needed=true" >> $GITHUB_OUTPUT\n'
                 f'          fi\n'
                 f'\n'
                 f'      - name: Configure Buildkite Build\n'
                 f'        id: config-buildkite\n'
                 f'        env:\n'
                 f'          GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}\n'
+                f'          HEAD_REF: ${{{{ github.event.pull_request.head.ref || github.ref }}}}\n'
                 f'        run: |\n'
-                f'          branch="${{{{ github.event.pull_request.head.ref || github.ref }}}}"\n'
+                f'          branch="$HEAD_REF"\n'
                 f'          branch="${{branch#"refs/heads/"}}"\n'
                 f'          branch="${{branch#"refs/tags/"}}"\n'
                 f'\n'
@@ -237,13 +272,13 @@ def main():
                 f'            # we add this label to the branch used by Buildkite to avoid it cancelling one of concurrent schedule and push builds on master\n'
                 f'            branch_label="${{branch}} (schedule)"\n'
                 f'          fi\n'
-                f'          echo "::set-output name=branch-label::${{branch_label}}"\n'
+                f'          echo "branch-label=${{branch_label}}" >> $GITHUB_OUTPUT\n'
                 f'\n'
                 f'          if [[ "${{{{ github.event_name }}}}" == "pull_request" ]]\n'
                 f'          then\n'
                 f'            head_sha="${{{{ github.event.pull_request.head.sha }}}}"\n'
                 f'            message="$(gh api https://api.github.com/repos/horovod/horovod/commits/${{head_sha}} -q .commit.message | head -n1)"\n'
-                f'            echo "::set-output name=message::${{message}}"\n'
+                f'            echo "message=${{message}}" >> $GITHUB_OUTPUT\n'
                 f'          fi\n'
                 f'\n'
                 f'      - name: Provide PR meta\n'
@@ -258,7 +293,7 @@ def main():
                 f'          cat pr.json\n'
                 f'\n'
                 f'      - name: Upload PR meta\n'
-                f'        uses: actions/upload-artifact@v2\n'
+                f'        uses: actions/upload-artifact@v4\n'
                 f"        if: github.event_name == 'pull_request'\n"
                 f'        with:\n'
                 f'          name: PR Meta\n'
@@ -269,12 +304,14 @@ def main():
                               name: str,
                               needs: List[str],
                               images: List[str],
-                              parallel_images: str,
                               tests_per_image: Dict[str, Set[str]],
                               tests: Dict[str, Dict],
+                              parallel_images: int = None,
                               attempts: int = 3) -> str:
         if 'init-workflow' not in needs:
             needs.insert(0, 'init-workflow')
+        if parallel_images is None:
+          parallel_images = len(images)
         failure = "'failure'"
         return (f'  {id}:\n'
                 f'    name: "{name} (${{{{ matrix.image }}}})"\n'
@@ -285,13 +322,13 @@ def main():
                 f'    runs-on: ubuntu-latest\n'
                 f'\n'
                 f'    strategy:\n'
-                f'      max-parallel: {len([image for image in images if parallel_images in image])}\n'
+                f'      max-parallel: {parallel_images}\n'
                 f'      fail-fast: false\n'
                 f'      matrix:\n'
                 f'        include:\n' +
                 '\n'.join([f'          - image: {image}\n' +
                            f''.join([f'            {test}: true\n'
-                                     for test in sorted(list(tests_per_image[image]))]) +
+                                     for test in sorted(list(tests_per_image.get(image, [])))]) +
                            f'            build_timeout: {30 if "-cpu-" in image else 40}\n'
                            for image in sorted(images)
                            # oneccl does not compile on GitHub Workflows:
@@ -309,7 +346,7 @@ def main():
                 f'          df -h\n'
                 f'          echo ::endgroup::\n'
                 f'\n'
-                f'          for dir in /usr/share/dotnet/sdk/\*/nuGetPackagesArchive.lzma \\\n'
+                f'          for dir in /usr/share/dotnet/sdk/\\*/nuGetPackagesArchive.lzma \\\n'
                 f'                     /usr/share/dotnet/shared \\\n'
                 f'                     /usr/local/lib/android/sdk/ndk \\\n'
                 f'                     /usr/local/lib/android/sdk/build-tools \\\n'
@@ -326,66 +363,19 @@ def main():
                 f'          echo ::endgroup::\n'
                 f'\n'
                 f'      - name: Checkout\n'
-                f'        uses: actions/checkout@v2\n'
+                f'        uses: actions/checkout@v4\n'
                 f'        with:\n'
                 f'          submodules: recursive\n'
                 f'\n'
                 f'      - name: Setup Python\n'
-                f'        uses: actions/setup-python@v2\n'
+                f'        uses: actions/setup-python@v5\n'
                 f'        with:\n'
                 f'          python-version: 3.8\n'
-                f'\n'
-                f'      - name: Setup docker-compose\n'
-                f'        run: pip install docker-compose\n'
-                f'\n'
-                f'      - name: Configure AWS credentials\n'
-                f'        id: aws\n'
-                f'        uses: aws-actions/configure-aws-credentials@v1\n'
-                f'        # AWS credentials are used to authenticate against AWS ECR to pull and push test images\n'
-                f'        # We can only authenticate when running on Horovod repo (not a fork)\n'
-                f'        if: >\n'
-                f'          github.repository == \'horovod/horovod\' &&\n'
-                f'          ( github.event_name != \'pull_request\' || github.event.pull_request.head.repo.full_name == github.repository )\n'
-                f'        continue-on-error: true\n'
-                f'        with:\n'
-                f'          aws-access-key-id: ${{{{ secrets.AWS_ACCESS_KEY_ID }}}}\n'
-                f'          aws-secret-access-key: ${{{{ secrets.AWS_SECRET_ACCESS_KEY }}}}\n'
-                f'          aws-region: us-east-1\n'
-                f'\n'
-                f'      - name: Login to Amazon ECR\n'
-                f'        id: ecr\n'
-                f'        if: steps.aws.outcome == \'success\'\n'
-                f'        continue-on-error: true\n'
-                f'        uses: aws-actions/amazon-ecr-login@v1\n'
-                f'\n'
-                f'      - name: Add cache_from to docker-compose YAML\n'
-                f'        if: steps.ecr.outcome == \'success\'\n'
-                f'        run: |\n'
-                f'          cat > docker-compose.test.override.yml <<EOF\n'
-                f'          version: \'2.3\'\n'
-                f'          services:\n'
-                f'            ${{{{ matrix.image }}}}:\n'
-                f'              build:\n'
-                f'                cache_from:\n'
-                f'                  - ${{{{ steps.ecr.outputs.registry }}}}/buildkite:horovod-${{{{ matrix.image }}}}-latest\n'
-                f'          EOF\n'
-                f'          cat docker-compose.test.override.yml\n'
-                f'        shell: bash\n'
-                f'\n'
-                f'      - name: Pull latest test image\n'
-                f'        if: steps.ecr.outcome == \'success\'\n'
-                f'        continue-on-error: true\n'
-                f'        run: |\n'
-                f'          docker pull ${{{{ steps.ecr.outputs.registry }}}}/buildkite:horovod-${{{{ matrix.image }}}}-latest\n'
-                f'        env:\n'
-                f'          DOCKER_BUILDKIT: 1\n'
                 f'\n'
                 f'      - name: Build\n'
                 f'        id: build\n'
                 f'        run: |\n'
-                f'          override_yaml=""\n'
-                f'          if [ -e docker-compose.test.override.yml ]; then override_yaml="-f docker-compose.test.override.yml"; fi\n'
-                f'          .github/timeout-and-retry.sh ${{{{ matrix.build_timeout }}}}m 3 10 docker-compose -f docker-compose.test.yml $override_yaml build --pull ${{{{ matrix.image }}}}\n'
+                f'          .github/timeout-and-retry.sh ${{{{ matrix.build_timeout }}}}m 3 10 docker compose -f docker-compose.test.yml build ${{{{ matrix.image }}}}\n'
                 f'        env:\n'
                 f'          COMPOSE_DOCKER_CLI_BUILD: 1\n'
                 f'          DOCKER_BUILDKIT: 1\n'
@@ -396,32 +386,17 @@ def main():
                            f'        if: always() && steps.build.outcome == \'success\' && matrix.{test_id} && {"true" if attempt == 1 else f"steps.{test_id}_run_{attempt-1}.outcome == {failure}"}\n'
                            f'        run: |\n'
                            f'          mkdir -p artifacts/${{{{ matrix.image }}}}/{test_id}_run_{attempt}\n'
-                           f'          docker-compose -f docker-compose.test.yml run -e GITHUB_ACTIONS --rm --volume "$(pwd)/artifacts/${{{{ matrix.image }}}}/{test_id}_run_{attempt}:/artifacts" ${{{{ matrix.image }}}} /usr/bin/timeout {test["timeout"]}m {test["command"]}\n'
+                           f'          docker compose -f docker-compose.test.yml run -e GITHUB_ACTIONS --rm --volume "$(pwd)/artifacts/${{{{ matrix.image }}}}/{test_id}_run_{attempt}:/artifacts" ${{{{ matrix.image }}}} /usr/bin/timeout {test["timeout"]}m {test["command"]}\n'
                            f'        shell: bash\n'
                            for test_id, test in sorted(tests.items(), key=lambda test: test[0])
                            for attempt in range(1, attempts+1)]) +
                 f'\n'
                 f'      - name: Upload Test Results\n'
-                f'        uses: actions/upload-artifact@v2\n'
+                f'        uses: actions/upload-artifact@v4\n'
                 f'        if: always() && contains(matrix.image, \'-cpu-\')\n'
                 f'        with:\n'
                 f'          name: Unit Test Results - ${{{{ matrix.image }}}}\n'
-                f'          path: artifacts/${{{{ matrix.image }}}}/**/*.xml\n'
-                f'\n'
-                f'      - name: Push test image\n'
-                f'        # We push test image to AWS ECR on push to Horovod master (not a fork)\n'
-                f'        if: >\n'
-                f'          github.event_name == \'push\' &&\n'
-                f'          github.ref == \'refs/heads/master\' &&\n'
-                f'          github.repository == \'horovod/horovod\' &&\n'
-                f'          steps.ecr.outcome == \'success\'\n'
-                f'        continue-on-error: true\n'
-                f'        run: |\n'
-                f'          docker image ls | head\n'
-                f'          docker tag horovod_${{{{ matrix.image }}}} ${{{{ steps.ecr.outputs.registry }}}}/buildkite:horovod-${{{{ matrix.image }}}}-latest\n'
-                f'          docker push ${{{{ steps.ecr.outputs.registry }}}}/buildkite:horovod-${{{{ matrix.image }}}}-latest\n'
-                f'          docker image ls | head\n'
-                f'        shell: bash\n')
+                f'          path: artifacts/${{{{ matrix.image }}}}/**/*.xml\n')
 
     def build_and_test_macos(id: str, name: str, needs: List[str], attempts: int = 3) -> str:
         if 'init-workflow' not in needs:
@@ -441,7 +416,7 @@ def main():
                 f'      matrix:\n'
                 f'        include:\n'
                 f''
-                f'          - image: test-cpu-openmpi-py3_7-tf1_15_5-keras2_2_4-torch1_6_0-mxnet1_5_0\n'
+                f'          - image: test-cpu-openmpi-py3_7-tf1_15_5-keras2_2_4-torch1_6_0-mxnet1_5_1_p0\n'
                 f'            HOROVOD_WITH_MPI: 1\n'
                 f'            HOROVOD_WITHOUT_GLOO: 1\n'
                 f'            TENSORFLOW: 1.15.0\n'
@@ -449,31 +424,32 @@ def main():
                 f'            PYTORCH: 1.6.0\n'
                 f'            PYTORCH_LIGHTNING: 1.3.8\n'
                 f'            TORCHVISION: 0.7.0\n'
-                f'            MXNET: 1.5.0\n'
+                f'            MXNET: 1.5.1.post0\n'
                 f'\n'
-                f'          - image: test-cpu-gloo-py3_8-tf2_5_1-keras2_4_3-torch1_8_1-mxnet1_5_0\n'
+                f''  # mxnet 1.8.0.post0 does not compile for macos due to missing dnnl_config.h
+                f'          - image: test-cpu-gloo-py3_8-tf2_9_2-keras2_9_0-torch1_11_0-mxnet1_7_0_p2\n'
                 f'            HOROVOD_WITHOUT_MPI: 1\n'
                 f'            HOROVOD_WITH_GLOO: 1\n'
-                f'            TENSORFLOW: 2.5.1\n'
-                f'            KERAS: 2.5.0rc0\n'
-                f'            PYTORCH: 1.8.1\n'
-                f'            PYTORCH_LIGHTNING: 1.3.8\n'
-                f'            TORCHVISION: 0.9.1\n'
-                f'            MXNET: 1.5.0\n'
+                f'            TENSORFLOW: 2.9.2\n'
+                f'            KERAS: 2.9.0\n'
+                f'            PYTORCH: 1.11.0\n'
+                f'            PYTORCH_LIGHTNING: 1.5.9\n'
+                f'            TORCHVISION: 0.12.0\n'
+                f'            MXNET: 1.7.0.post2\n'
                 f'\n'
-                f'          - image: test-openmpi-cpu-gloo-py3_8-tf2_6_0-keras2_6_0-torch1_9_0-mxnet1_5_0\n'
+                f'          - image: test-openmpi-cpu-gloo-py3_8-tf2_10_0-keras2_10_0-torch1_12_1-mxnet1_9_1\n'
                 f'            HOROVOD_WITH_MPI: 1\n'
                 f'            HOROVOD_WITH_GLOO: 1\n'
-                f'            TENSORFLOW: 2.6.0\n'
-                f'            KERAS: 2.6.0\n'
-                f'            PYTORCH: 1.9.0\n'
-                f'            PYTORCH_LIGHTNING: 1.3.8\n'
-                f'            TORCHVISION: 0.10.0\n'
-                f'            MXNET: 1.5.0\n'
+                f'            TENSORFLOW: 2.10.0\n'
+                f'            KERAS: 2.10.0\n'
+                f'            PYTORCH: 1.12.1\n'
+                f'            PYTORCH_LIGHTNING: 1.5.9\n'
+                f'            TORCHVISION: 0.13.1\n'
+                f'            MXNET: 1.9.1\n'
                 f'\n'
                 f'    steps:\n'
                 f'      - name: Checkout\n'
-                f'        uses: actions/checkout@v2\n'
+                f'        uses: actions/checkout@v4\n'
                 f'        with:\n'
                 f'          submodules: recursive\n'
                 f'\n'
@@ -504,6 +480,7 @@ def main():
                 f'\n'
                 f'          python -m pip install -U pip\n'
                 f'          pip install tensorflow==${{TENSORFLOW}} keras==${{KERAS}}\n'
+                f'          if [[ ${{TENSORFLOW}} == 1.* ]] || [[ ${{TENSORFLOW}} == 2.[012345].* ]]; then pip install "h5py<3" "protobuf~=3.20"; fi\n'
                 f'          pip install torch==${{PYTORCH}} pytorch_lightning==${{PYTORCH_LIGHTNING}} torchvision==${{TORCHVISION}}\n'
                 f'          pip install mxnet==${{MXNET}}\n'
                 f'          HOROVOD_WITH_TENSORFLOW=1 HOROVOD_WITH_PYTORCH=1 HOROVOD_WITH_MXNET=1 pip install --no-cache-dir .[test]\n'
@@ -512,7 +489,7 @@ def main():
                 '\n'.join([f'      - name: Test [attempt {attempt} of {attempts}]\n'
                            f'        id: test-{attempt}\n'
                            f'        continue-on-error: {"true" if attempt < attempts else "false"}\n'
-                           f'        if: always() && {"true" if attempt == 1 else f"steps.test-{attempt-1}.outcome == {failure}"}\n'
+                           f'        if: always() && steps.build.outcome == \'success\' && {"true" if attempt == 1 else f"steps.test-{attempt-1}.outcome == {failure}"}\n'
                            f'\n'
                            f'        run: |\n'
                            f'          export PATH=$(pyenv root)/shims:$PATH\n'
@@ -521,8 +498,8 @@ def main():
                            f'\n'
                            f'          artifacts_path="$(pwd)/artifacts/${{{{ matrix.image }}}}-macos-run-{attempt}"\n'
                            f'          mkdir -p "$artifacts_path"\n'
-                           f'          echo "::set-output name=artifacts-path::$artifacts_path"\n'
-                           f'          echo pytest -v --capture=no --continue-on-collection-errors --junit-xml=$artifacts_path/junit.\$1.\${{HOROVOD_RANK:-\${{OMPI_COMM_WORLD_RANK:-\${{PMI_RANK}}}}}}.\$2.xml \${{@:2}} > pytest.sh\n'
+                           f'          echo "artifacts-path=$artifacts_path" >> $GITHUB_OUTPUT\n'
+                           f'          echo pytest -v --capture=no --continue-on-collection-errors --junit-xml=$artifacts_path/junit.\\$1.\\${{HOROVOD_RANK:-\\${{OMPI_COMM_WORLD_RANK:-\\${{PMI_RANK}}}}}}.\\$2.xml \\${{@:2}} > pytest.sh\n'
                            f'          chmod u+x pytest.sh\n'
                            f'\n'
                            f'          cd test/parallel\n'
@@ -530,7 +507,7 @@ def main():
                            for attempt in range(1, attempts+1)]) +
                 f'\n'
                 f'      - name: Upload Test Results\n'
-                f'        uses: actions/upload-artifact@v2\n'
+                f'        uses: actions/upload-artifact@v4\n'
                 f'        if: always()\n'
                 f'        with:\n'
                 f'          name: Unit Test Results - ${{{{ matrix.image }}}}-macos\n'
@@ -541,8 +518,8 @@ def main():
     def trigger_buildkite_job(id: str, name: str, needs: List[str], mode: str) -> str:
         if 'init-workflow' not in needs:
             needs.insert(0, 'init-workflow')
-        return (f'  {id}:\n'
-                f'    name: "{name}"\n'
+        return (f'  {id}-trigger:\n'
+                f'    name: "{name} (trigger Builtkite)"\n'
                 f'    needs: [{", ".join(needs)}]\n'
                 f'    runs-on: ubuntu-latest\n'
                 f'    if: >\n'
@@ -550,11 +527,13 @@ def main():
                 f"      needs.init-workflow.outputs.run-at-all == 'true' &&\n"
                 f"      needs.init-workflow.outputs.run-builds-and-tests == 'true' &&\n"
                 f'      ( github.event_name != \'pull_request\' || github.event.pull_request.head.repo.full_name == github.repository )\n'
+                f'    outputs:\n'
+                f'      url: ${{{{ steps.build.outputs.url }}}}\n'
                 f'\n'
                 f'    steps:\n'
                 f'      - name: Trigger Buildkite Pipeline\n'
                 f'        id: build\n'
-                f'        uses: EnricoMi/trigger-pipeline-action@master\n'
+                f'        uses: buildkite/trigger-pipeline-action@v1.3.1\n'
                 f'        env:\n'
                 f'          PIPELINE: "horovod/horovod"\n'
                 f'          # COMMIT is taken from GITHUB_SHA\n'
@@ -564,19 +543,24 @@ def main():
                 f'          BUILDKITE_API_ACCESS_TOKEN: ${{{{ secrets.BUILDKITE_TOKEN }}}}\n'
                 f'          BUILD_ENV_VARS: "{{\\"PIPELINE_MODE\\": \\"{mode}\\"}}"\n'
                 f'\n'
+                f'  {id}:\n'
+                f'    name: "{name} (download Builtkite)"\n'
+                f'    needs: [{id}-trigger]\n'
+                f'    runs-on: ubuntu-latest\n'
+                f'\n'
+                f'    steps:\n'
                 f'      - name: Download Buildkite Artifacts\n'
                 f'        id: download\n'
-                f'        uses: docker://ghcr.io/enricomi/download-buildkite-artifact-action:v1\n'
+                f'        uses: EnricoMi/download-buildkite-artifact-action@v1\n'
                 f'        with:\n'
-                f'          github_token: ${{{{ github.token }}}}\n'
                 f'          buildkite_token: ${{{{ secrets.BUILDKITE_TOKEN }}}}\n'
-                f'          buildkite_build_url: ${{{{ steps.build.outputs.url }}}}\n'
+                f'          buildkite_build_url: ${{{{ needs.{id}-trigger.outputs.url }}}}\n'
                 f'          ignore_build_states: blocked,canceled,skipped,not_run\n'
                 f'          ignore_job_states: timed_out\n'
                 f'          output_path: artifacts/Unit Test Results - {mode} on Builtkite\n'
                 f'\n'
                 f'      - name: Upload Test Results\n'
-                f'        uses: actions/upload-artifact@v2\n'
+                f'        uses: actions/upload-artifact@v4\n'
                 f'        if: always()\n'
                 f'        with:\n'
                 f'          name: Unit Test Results - {mode} on Builtkite\n'
@@ -588,7 +572,7 @@ def main():
                 f'          steps.download.conclusion == \'success\' &&\n'
                 f'          steps.download.outputs.build-state != \'passed\'\n'
                 f'        run: |\n'
-                f'          echo "::warning::Buildkite pipeline did not pass: ${{{{ steps.build.outputs.url }}}}"\n'
+                f'          echo "::warning::Buildkite pipeline did not pass: ${{{{ needs.{id}-trigger.outputs.url }}}}"\n'
                 f'          exit 1\n')
 
     def publish_docker_images(needs: List[str], images: List[str]) -> str:
@@ -599,7 +583,7 @@ def main():
         return (f'  docker-config:\n'
                 f'    name: Configure docker build\n'
                 f'    needs: [{", ".join(needs)}]\n'
-                f"    # build-and-test-cpu, build-gpu and buildkite might have been skipped (! needs.init-workflow.outputs.run-builds-and-tests)\n"
+                f"    # build-and-test and buildkite might have been skipped (! needs.init-workflow.outputs.run-builds-and-tests)\n"
                 f'    # buildkite might have been skipped (workflow runs for a fork PR),\n'
                 f'    # we still want to build docker images (though we might not want to push them)\n'
                 f'    if: >\n'
@@ -625,9 +609,9 @@ def main():
                 f'          echo Repository: ${{{{ github.repository }}}}\n'
                 f'          echo Event: ${{{{ github.event_name }}}}\n'
                 f'          echo Run: $run\n'
-                f'          echo "::set-output name=run::$run"\n'
+                f'          echo "run=$run" >> $GITHUB_OUTPUT\n'
                 f'          echo Push: $push\n'
-                f'          echo "::set-output name=push::$push"\n'
+                f'          echo "push=$push" >> $GITHUB_OUTPUT\n'
                 f'\n'
                 f'  docker-build:\n'
                 f'    name: Build docker image ${{{{ matrix.docker-image }}}} (push=${{{{ needs.docker-config.outputs.push }}}})\n'
@@ -656,13 +640,13 @@ def main():
                 f'\n'
                 f'    steps:\n'
                 f'      - name: Checkout\n'
-                f'        uses: actions/checkout@v2\n'
+                f'        uses: actions/checkout@v4\n'
                 f'        with:\n'
                 f'          submodules: \'recursive\'\n'
                 f'\n'
                 f'      - name: Docker meta\n'
                 f'        id: meta\n'
-                f'        uses: crazy-max/ghaction-docker-meta@v2\n'
+                f'        uses: crazy-max/ghaction-docker-meta@v5\n'
                 f'        with:\n'
                 f'          # list of Docker images to use as base name for tags\n'
                 f'          images: |\n'
@@ -677,14 +661,14 @@ def main():
                 f'            type=semver,pattern={{{{major}}}}\n'
                 f'            type=sha\n'
                 f'\n'
-                f'      - name: Set up QEMU\n'
-                f'        uses: docker/setup-qemu-action@v1\n'
                 f'      - name: Set up Docker Buildx\n'
-                f'        uses: docker/setup-buildx-action@v1\n'
+                f'        uses: docker/setup-buildx-action@v3\n'
+                f'        with:\n'
+                f'          driver: docker\n'
                 f'\n'
                 f'      - name: Login to DockerHub\n'
                 f'        if: needs.docker-config.outputs.push == \'true\'\n'
-                f'        uses: docker/login-action@v1\n'
+                f'        uses: docker/login-action@v3\n'
                 f'        with:\n'
                 f'          username: ${{{{ secrets.DOCKERHUB_USERNAME }}}}\n'
                 f'          password: ${{{{ secrets.DOCKERHUB_TOKEN }}}}\n'
@@ -699,7 +683,7 @@ def main():
                 f'          df -h\n'
                 f'          echo ::endgroup::\n'
                 f'\n'
-                f'          for dir in /usr/share/dotnet/sdk/\*/nuGetPackagesArchive.lzma \\\n'
+                f'          for dir in /usr/share/dotnet/sdk/\\*/nuGetPackagesArchive.lzma \\\n'
                 f'                     /usr/share/dotnet/shared \\\n'
                 f'                     /usr/local/lib/android/sdk/ndk \\\n'
                 f'                     /usr/local/lib/android/sdk/build-tools \\\n'
@@ -715,8 +699,44 @@ def main():
                 f'          df -h\n'
                 f'          echo ::endgroup::\n'
                 f'\n'
-                f'      - name: Build and push\n'
-                f'        uses: docker/build-push-action@v2\n'
+                f'      - name: Build image\n'
+                f'        id: build\n'
+                f'        uses: docker/build-push-action@v5\n'
+                f'        timeout-minutes: 60\n'
+                f'        with:\n'
+                f'          context: .\n'
+                f'          file: ./docker/${{{{ matrix.docker-image }}}}/Dockerfile\n'
+                f'          pull: true\n'
+                f'          push: false\n'
+                f'          load: true\n'
+                f'          tags: horovod-test\n' +
+                f'          outputs: type=docker\n' +
+                f'\n'
+                f'      - name: List image\n'
+                f'        run: |\n'
+                f'          docker image ls horovod-test\n' +
+                f'\n'
+                f'      - name: Prepare container for test\n'
+                f'        run: |\n'
+                f'          grep "RUN sed" Dockerfile.test.cpu | sed "s/^RUN //" | docker run -i --name horovod-test horovod-test:latest /bin/bash\n' +
+                ''.join([
+                    f'\n' +
+                    f"      - name: Test image ({framework} {comm})\n" +
+                    f'        if: always() && steps.build.outcome == \'success\'' + (' && matrix.docker-image != \'horovod-ray\'' if comm == 'mpi' or 'mxnet' in example else '') + '\n' +
+                    f'        run: |\n' +
+                    f'          docker start -ai horovod-test <<<"{example}"\n'
+                    for comm in ['gloo', 'mpi']
+                    for example in ([
+                        f'python /horovod/examples/pytorch/pytorch_mnist.py --data-dir /data/pytorch_datasets --num-proc 2 --hosts localhost:2 --communication {comm}',
+                        f'python /horovod/examples/tensorflow2/tensorflow2_keras_mnist.py 2 localhost:2 {comm}',
+                    ])
+                    for framework in [re.sub('\\/.*', '', re.sub('.*\\/examples\\/', '', example))]
+                ]) +
+                f'\n'
+                f'      - name: Push image\n'
+                f'        if: needs.docker-config.outputs.push == \'true\'\n'
+                f'        uses: docker/build-push-action@v5\n'
+                f'        timeout-minutes: 60\n'
                 f'        with:\n'
                 f'          context: .\n'
                 f'          file: ./docker/${{{{ matrix.docker-image }}}}/Dockerfile\n'
@@ -756,7 +776,7 @@ def main():
                 f'          - name: Docs Summary\n'
                 f'            left_file: README.rst\n'
                 f'            right_file: docs/summary.rst\n'
-                f'            init: sed -i -e s/docs\///g README.rst\n'
+                f'            init: sed -i -e s/docs\\///g README.rst\n'
                 f'\n'
                 f'          - name: Examples Keras Spark3\n'
                 f'            left_file: examples/spark/keras/keras_spark_rossmann_run.py\n'
@@ -764,7 +784,7 @@ def main():
                 f'\n'
                 f'    steps:\n'
                 f'      - name: Checkout\n'
-                f'        uses: actions/checkout@v1\n'
+                f'        uses: actions/checkout@v4\n'
                 f'\n'
                 f'      - name: Diffing ${{{{ matrix.left_file }}}} with ${{{{ matrix.right_file }}}}\n'
                 f'        env:\n'
@@ -790,20 +810,23 @@ def main():
                 f'          fi\n')
 
     with open(path.joinpath('workflows', 'ci.yaml').absolute(), 'wt') as w:
+        mins = ['tfmin', 'torchmin', 'mxnetmin']
         heads = ['tfhead', 'torchhead', 'mxnethead']
-        release_images = [image for image in images if not all(head in image for head in heads)]
+        allmin_images = [image for image in images if all(min in image for min in mins)]
+        allhead_images = [image for image in images if all(head in image for head in heads)]
+        release_images = [image for image in images if image not in allhead_images + allmin_images]
         cpu_release_images = [image for image in release_images if '-cpu-' in image]
         gpu_release_images = [image for image in release_images if '-gpu-' in image or '-mixed-' in image]
-        allhead_images = [image for image in images if all(head in image for head in heads)]
         workflow = workflow_header() + jobs(
             init_workflow_job(),
-            # changing these names require changes in the workflow-conclusion step in ci-fork.yaml
-            build_and_test_images(id='build-and-test', name='Build and Test', needs=['init-workflow'], images=release_images, parallel_images='-cpu-', tests_per_image=tests_per_image, tests=tests),
-            build_and_test_images(id='build-and-test-heads', name='Build and Test heads', needs=['build-and-test'], images=allhead_images, parallel_images='', tests_per_image=tests_per_image, tests=tests),
+            # changing these names require changes in the workflow-conclusion step in ci-results.yaml
+            build_and_test_images(id='build-and-test', name='Build and Test', needs=['init-workflow'], images=release_images, parallel_images=len(cpu_release_images), tests_per_image=tests_per_image, tests=tests),
+            build_and_test_images(id='build-and-test-heads', name='Build and Test heads', needs=['build-and-test'], images=allhead_images, tests_per_image=tests_per_image, tests=tests),
+            build_and_test_images(id='build-mins', name='Build mins', needs=['build-and-test'], images=allmin_images, tests_per_image=tests_per_image, tests={}),
             build_and_test_macos(id='build-and-test-macos', name='Build and Test macOS', needs=['build-and-test']),
-            trigger_buildkite_job(id='buildkite', name='Build and Test GPU (on Builtkite)', needs=['build-and-test'], mode='GPU NON HEADS'),
-            trigger_buildkite_job(id='buildkite-heads', name='Build and Test GPU heads (on Builtkite)', needs=['build-and-test'], mode='GPU HEADS'),
-            publish_docker_images(needs=['build-and-test', 'buildkite'], images=['horovod', 'horovod-cpu', 'horovod-ray']),
+            trigger_buildkite_job(id='buildkite', name='Build and Test GPU', needs=['build-and-test'], mode='GPU NON HEADS'),
+            trigger_buildkite_job(id='buildkite-heads', name='Build and Test GPU heads', needs=['build-and-test'], mode='GPU HEADS'),
+            publish_docker_images(needs=['build-and-test', 'buildkite'], images=['horovod', 'horovod-cpu', 'horovod-nvtabular', 'horovod-ray']),
             sync_files(needs=['init-workflow'])
         )
         print(workflow, file=w, end='')

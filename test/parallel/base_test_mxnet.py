@@ -15,10 +15,11 @@
 # ==============================================================================
 
 import os
+import platform
 import sys
 import itertools
 import unittest
-from distutils.version import LooseVersion
+from packaging import version
 
 import pytest
 import numpy as np
@@ -44,6 +45,8 @@ try:
 except ImportError:
     has_gpu = False
     HAS_MXNET = False
+
+_is_mac = platform.system() == 'Darwin'
 
 # Set environment variable to enable adding/removing process sets after initializing Horovod.
 os.environ["HOROVOD_DYNAMIC_PROCESS_SETS"] = "1"
@@ -88,7 +91,7 @@ class MXTests:
             tensor = mx.nd.random.uniform(-100, 100, shape=shapes[dim],
                                           ctx=ctx)
             tensor = tensor.astype(dtype)
-            summed = hvd.allreduce(tensor, average=False, name=str(count))
+            summed = hvd.allreduce(tensor, op=hvd.Sum, name=str(count))
             multiplied = tensor * size
             count += 1
 
@@ -121,7 +124,7 @@ class MXTests:
             tensor = mx.nd.random.uniform(-100, 100, shape=shapes[dim],
                                           ctx=ctx)
             tensor = tensor.astype(dtype)
-            averaged = hvd.allreduce(tensor, average=True, name=str(count))
+            averaged = hvd.allreduce(tensor, op=hvd.Average, name=str(count))
             tensor *= size
             tensor /= size
             count += 1
@@ -156,7 +159,7 @@ class MXTests:
                                           ctx=ctx)
             tensor = tensor.astype(dtype)
             multiplied = tensor * size
-            hvd.allreduce_(tensor, average=False, name=str(count))
+            hvd.allreduce_(tensor, op=hvd.Sum, name=str(count))
             count += 1
 
             # Threshold for floating point equality depends on number of
@@ -172,6 +175,86 @@ class MXTests:
 
             assert almost_equal(tensor.asnumpy(), multiplied.asnumpy(), atol=threshold), \
                 f'hvd.allreduce produces incorrect results for self: {hvd.rank()} {count} {dtype} {dim}'
+
+    def test_horovod_allreduce_min(self):
+        """Test that the allreduce correctly finds minimum value of 1D, 2D, 3D tensors."""
+        hvd.init()
+        size = hvd.size()
+        rank = hvd.rank()
+        dtypes = self.filter_supported_types(['int32',   'int64',
+                                              'float32', 'float64'])
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        count = 0
+        shapes = [(size), (size, 17), (size, 17, 17), (size, 17, 17, 17)]
+        for dtype, dim in itertools.product(dtypes, dims):
+            mx.random.seed(1234, ctx=ctx)
+            tensors = mx.nd.random.uniform(-100, 100, shape=shapes[dim],
+                                           ctx=ctx).astype(dtype)
+            tensor = tensors[rank,:]
+            result = hvd.allreduce(tensor, op=hvd.Min, name=str(count))
+            reference = mx.nd.min(tensors, axis=0)
+            count += 1
+
+            assert same(result.asnumpy(), reference.asnumpy()), \
+                f'hvd.allreduce produces incorrect results for min: {hvd.rank()} {count} {dtype} {dim}'
+
+    def test_horovod_allreduce_max(self):
+        """Test that the allreduce correctly finds maximum value of 1D, 2D, 3D tensors."""
+        hvd.init()
+        size = hvd.size()
+        rank = hvd.rank()
+        dtypes = self.filter_supported_types(['int32',   'int64',
+                                              'float32', 'float64'])
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        count = 0
+        shapes = [(size), (size, 17), (size, 17, 17), (size, 17, 17, 17)]
+        for dtype, dim in itertools.product(dtypes, dims):
+            mx.random.seed(1234, ctx=ctx)
+            tensors = mx.nd.random.uniform(-100, 100, shape=shapes[dim],
+                                           ctx=ctx).astype(dtype)
+            tensor = tensors[rank,:]
+            result = hvd.allreduce(tensor, op=hvd.Max, name=str(count))
+            reference = mx.nd.max(tensors, axis=0)
+            count += 1
+
+            assert same(result.asnumpy(), reference.asnumpy()), \
+                f'hvd.allreduce produces incorrect results for max: {hvd.rank()} {count} {dtype} {dim}'
+
+    def test_horovod_allreduce_product(self):
+        """Test that the allreduce correctly finds product value of 1D, 2D, 3D tensors."""
+        hvd.init()
+        size = hvd.size()
+        rank = hvd.rank()
+        dtypes = self.filter_supported_types(['int32',   'int64',
+                                              'float32', 'float64'])
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        count = 0
+        shapes = [(size), (size, 17), (size, 17, 17), (size, 17, 17, 17)]
+        for dtype, dim in itertools.product(dtypes, dims):
+            mx.random.seed(1234, ctx=ctx)
+            tensors = mx.nd.random.uniform(-100, 100, shape=shapes[dim],
+                                           ctx=ctx).astype(dtype)
+            tensor = tensors[rank,:]
+            result = hvd.allreduce(tensor, op=hvd.Product, name=str(count))
+            reference = mx.nd.prod(tensors, axis=0)
+            count += 1
+
+            # Threshold for floating point equality depends on number of
+            # ranks, since we're comparing against precise multiplication.
+            if size <= 3 or dtype in ['int32', 'int64']:
+                threshold = 0
+            elif size < 10:
+                threshold = 1e-4
+            elif size < 15:
+                threshold = 5e-4
+            else:
+                break
+
+            assert almost_equal(result.asnumpy(), reference.asnumpy(), atol=threshold), \
+                f'hvd.allreduce produces incorrect results for prod: {hvd.rank()} {count} {dtype} {dim}'
 
     def test_horovod_allreduce_prescale(self):
         """Test that the allreduce correctly sums 1D, 2D, 3D tensors with prescaling."""
@@ -191,7 +274,7 @@ class MXTests:
                                           ctx=ctx)
             tensor = tensor.astype(dtype)
             factor = np.random.uniform()
-            scaled = hvd.allreduce(tensor, average=False, name=str(count),
+            scaled = hvd.allreduce(tensor, op=hvd.Sum, name=str(count),
                                    prescale_factor=factor)
 
             factor = mx.nd.array([factor], dtype='float64', ctx=ctx)
@@ -243,7 +326,7 @@ class MXTests:
                                           ctx=ctx)
             tensor = tensor.astype(dtype)
             factor = np.random.uniform()
-            scaled = hvd.allreduce(tensor, average=False, name=str(count),
+            scaled = hvd.allreduce(tensor, op=hvd.Sum, name=str(count),
                                    postscale_factor=factor)
 
             factor = mx.nd.array([factor], dtype='float64', ctx=ctx)
@@ -343,11 +426,11 @@ class MXTests:
                                                    ctx=ctx)
             if rank in even_ranks:
                 tensor = even_rank_tensor.astype(dtype)
-                summed = hvd.allreduce(tensor, average=False, name=str(count), process_set=even_set)
+                summed = hvd.allreduce(tensor, op=hvd.Sum, name=str(count), process_set=even_set)
                 multiplied = tensor * len(even_ranks)
             elif rank in odd_ranks:
                 tensor = odd_rank_tensor.astype(dtype)
-                summed = hvd.allreduce(tensor, average=False, name=str(count), process_set=odd_set)
+                summed = hvd.allreduce(tensor, op=hvd.Sum, name=str(count), process_set=odd_set)
                 multiplied = tensor * len(odd_ranks)
             count += 1
 
@@ -439,7 +522,7 @@ class MXTests:
             tensor = mx.nd.ones(shape=shapes[dim], ctx=ctx)
             # tensor*(i+1) result will be destroyed immediately after this call
             # See https://github.com/horovod/horovod/issues/1533
-            sum = hvd.allreduce(tensor * (i + 1), average=False)
+            sum = hvd.allreduce(tensor * (i + 1), op=hvd.Sum)
             expected = tensor * (i + 1) * size
             assert same(sum.asnumpy(), expected.asnumpy())
 
@@ -463,7 +546,7 @@ class MXTests:
 
             multiplied = [tensor * size for tensor in tensors]
 
-            summed = hvd.grouped_allreduce(tensors, average=False, name=str(count))
+            summed = hvd.grouped_allreduce(tensors, op=hvd.Sum, name=str(count))
 
             count += 1
 
@@ -502,7 +585,7 @@ class MXTests:
             tensors = [tensor * size for tensor in tensors]
             tensors = [tensor / size for tensor in tensors]
 
-            averaged = hvd.grouped_allreduce(tensors, average=True, name=str(count))
+            averaged = hvd.grouped_allreduce(tensors, op=hvd.Average, name=str(count))
 
             count += 1
 
@@ -541,7 +624,7 @@ class MXTests:
 
             multiplied = [tensor * size for tensor in tensors]
 
-            hvd.grouped_allreduce_(tensors, average=False, name=str(count))
+            hvd.grouped_allreduce_(tensors, op=hvd.Sum, name=str(count))
 
             count += 1
 
@@ -591,12 +674,12 @@ class MXTests:
             if rank in even_ranks:
                 tensors = [tensor.astype(dtype) for tensor in even_rank_tensors]
                 multiplied = [tensor * len(even_ranks) for tensor in tensors]
-                summed = hvd.grouped_allreduce(tensors, average=False, name=str(count),
+                summed = hvd.grouped_allreduce(tensors, op=hvd.Sum, name=str(count),
                                                process_set=even_set)
             elif rank in odd_ranks:
                 tensors = [tensor.astype(dtype) for tensor in odd_rank_tensors]
                 multiplied = [tensor * len(odd_ranks) for tensor in tensors]
-                summed = hvd.grouped_allreduce(tensors, average=False, name=str(count),
+                summed = hvd.grouped_allreduce(tensors, op=hvd.Sum, name=str(count),
                                                process_set=odd_set)
             count += 1
 
@@ -1070,6 +1153,89 @@ class MXTests:
         except (MXNetError, RuntimeError):
             pass
 
+    def test_horovod_grouped_allgather(self):
+        """Test that the grouped allgather correctly gathers 1D, 2D, 3D tensors."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        dtypes = ['int32',   'int64',
+                  'float32', 'float64']
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        for dtype, dim in itertools.product(dtypes, dims):
+            tensors = [mx.ndarray.ones(shape=[17] * dim, dtype=dtype, ctx=ctx) * rank
+                       for _ in range(5)]
+            gathered = hvd.grouped_allgather(tensors)
+
+            for g in gathered:
+                assert list(g.shape) == [17 * size] + [17] * (dim - 1)
+                for i in range(size):
+                    rank_tensor = g[i * 17:(i + 1) * 17]
+                    assert list(rank_tensor.shape) == [17] * dim, \
+                        'hvd.grouped_allgather produces incorrect gathered shape'
+                    assert rank_tensor.min() == i, 'hvd.grouped_allgather produces incorrect gathered tensor'
+                    assert rank_tensor.max() == i, 'hvd.grouped_allgather produces incorrect gathered tensor'
+
+    def test_horovod_grouped_allgather_process_sets(self):
+        """Test that the grouped allgather correctly gathers 1D, 2D, 3D tensors
+        if restricted to non-global process sets."""
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        if hvd.ccl_built():
+            self.skipTest("Multiple process sets currently do not support CCL.")
+
+        even_ranks = [rk for rk in range(0, size) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, size) if rk % 2 == 1]
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+        if rank in even_ranks:
+            set_size = len(even_ranks)
+            set_ranks = even_ranks
+            this_set = even_set
+        elif rank in odd_ranks:
+            set_size = len(odd_ranks)
+            set_ranks = odd_ranks
+            this_set = odd_set
+
+        dtypes = ['int32',   'int64',
+                  'float32', 'float64']
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        for dtype, dim in itertools.product(dtypes, dims):
+            tensors = [mx.ndarray.ones(shape=[17] * dim, dtype=dtype, ctx=ctx) * rank for _ in range(5)]
+            gathered = hvd.grouped_allgather(tensors, process_set=this_set)
+
+            for g in gathered:
+                assert list(g.shape) == [17 * set_size] + [17] * (dim - 1)
+                for i in range(set_size):
+                    rank_tensor = g[i * 17:(i + 1) * 17]
+                    assert list(rank_tensor.shape) == [17] * dim, \
+                        'hvd.grouped_allgather produces incorrect gathered shape'
+                    value = set_ranks[i]
+                    assert rank_tensor.min() == value, 'hvd.grouped_allgather produces incorrect gathered tensor'
+                    assert rank_tensor.max() == value, 'hvd.grouped_allgather produces incorrect gathered tensor'
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
+
+    @unittest.skipUnless(has_gpu, "no gpu detected")
+    def test_horovod_grouped_allgather_cpu_gpu_error(self):
+        """Test that the grouped allgather raises an error if the input tensor
+           list contains a mix of tensors on CPU and GPU."""
+        hvd.init()
+        local_rank = hvd.local_rank()
+        tensors = [mx.nd.ones(shape=[10], ctx=mx.gpu(local_rank) if i % 2
+                   else mx.cpu(local_rank)) for i in range(5)]
+
+        try:
+            outputs = hvd.grouped_allgather(tensors)
+            mx.nd.waitall()
+            assert False, 'hvd.grouped_allgather did not throw cpu-gpu error'
+        except (MXNetError, RuntimeError):
+            pass
+
     def test_broadcast_object(self):
         hvd.init()
 
@@ -1521,7 +1687,7 @@ class MXTests:
         g = mx.random.uniform(shape=shape, ctx=ctx, dtype=np.float32)
         
         # Update that is only averaged over even_set
-        if LooseVersion(mx.__version__) >= LooseVersion('2.0.0'):
+        if version.parse(mx.__version__).major >= 2:
             opt.update([0], [w], [g], [opt.create_state(0, w)])
         else:
             opt.update(0, w, g, opt.create_state(0, w))
@@ -1540,6 +1706,591 @@ class MXTests:
                 gathered_data = all_w.reshape(1,-1)[:,start:start + w.size].asnumpy()
                 # They might randomly agree by chance, but that's extremely unlikely:
                 self.assertFalse(np.allclose(my_data, gathered_data))
+
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
+
+    def test_horovod_reducescatter(self):
+        """Test that reducescatter correctly sums and scatters 1D, 2D, 3D tensors."""
+        if hvd.ccl_built():
+            self.skipTest("Reducescatter is not supported yet with oneCCL operations.")
+        if _is_mac and hvd.gloo_built() and not hvd.mpi_built():
+            self.skipTest("ReducescatterGloo is not supported on macOS")
+        hvd.init()
+        size = hvd.size()
+        rank = hvd.rank()
+        dtypes = self.filter_supported_types(['int32',   'int64',
+                                              'float32', 'float64',
+                                              'float16'])
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        count = 0
+        for dtype, dim in itertools.product(dtypes, dims):
+            # MXNet uses gpu_id as part of the seed, so to get identical seeds
+            # we must set a context.
+            mx.random.seed(1234, ctx=ctx)
+            tensor = mx.nd.random.uniform(-100, 100, shape=[size * 4] * dim,
+                                          ctx=ctx)
+            tensor = tensor.astype(dtype)
+            summed = hvd.reducescatter(tensor, op=hvd.Sum, name=str(count))
+            expected = tensor[rank * 4:(rank + 1) * 4] * size
+            count += 1
+
+            # Threshold for floating point equality depends on number of
+            # ranks, since we're comparing against precise multiplication.
+            if size <= 3 or dtype in ['int32', 'int64']:
+                threshold = 0
+            elif size < 10:
+                threshold = 1e-4
+            elif size < 15:
+                threshold = 5e-4
+            else:
+                break
+
+            assert almost_equal(summed.asnumpy(), expected.asnumpy(), atol=threshold), \
+                f'hvd.reducescatter produces incorrect results: {hvd.rank()} {count} {dtype} {dim}'
+
+    def test_horovod_reducescatter_average(self):
+        """Test that reducescatter correctly averages and scatters 1D, 2D, 3D tensors."""
+        if hvd.ccl_built():
+            self.skipTest("Reducescatter is not supported yet with oneCCL operations.")
+        if _is_mac and hvd.gloo_built() and not hvd.mpi_built():
+            self.skipTest("ReducescatterGloo is not supported on macOS")
+        hvd.init()
+        size = hvd.size()
+        rank = hvd.rank()
+        dtypes = self.filter_supported_types(['int32',   'int64',
+                                              'float32', 'float64',
+                                              'float16'])
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        count = 0
+        for dtype, dim in itertools.product(dtypes, dims):
+            # MXNet uses gpu_id as part of the seed, so to get identical seeds
+            # we must set a context.
+            mx.random.seed(1234, ctx=ctx)
+            tensor = mx.nd.random.uniform(-100, 100, shape=[size * 4] * dim,
+                                          ctx=ctx)
+            tensor = tensor.astype(dtype)
+            averaged = hvd.reducescatter(tensor, op=hvd.Average, name=str(count))
+            expected = tensor[rank * 4:(rank + 1) * 4]
+
+            count += 1
+
+            # Threshold for floating point equality depends on number of
+            # ranks, since we're comparing against precise multiplication.
+            if size <= 3 or dtype in ['int32', 'int64']:
+                threshold = 0
+            elif size < 10:
+                threshold = 1e-4
+            elif size < 15:
+                threshold = 5e-4
+            else:
+                break
+
+            assert almost_equal(averaged.asnumpy(), expected.asnumpy(), atol=threshold), \
+                f'hvd.reducescatter produces incorrect results: {hvd.rank()} {count} {dtype} {dim}'
+
+    def test_horovod_reducescatter_prescale(self):
+        """Test that reducescatter correctly sums and scatters 1D, 2D, 3D tensors with prescaling."""
+        if hvd.ccl_built():
+            self.skipTest("Reducescatter is not supported yet with oneCCL operations.")
+        if _is_mac and hvd.gloo_built() and not hvd.mpi_built():
+            self.skipTest("ReducescatterGloo is not supported on macOS")
+        hvd.init()
+        size = hvd.size()
+        rank = hvd.rank()
+        dtypes = self.filter_supported_types(['int32',   'int64',
+                                              'float32', 'float64',
+                                              'float16'])
+        int_types = ['int32', 'int64']
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        count = 0
+        for dtype, dim in itertools.product(dtypes, dims):
+            # MXNet uses gpu_id as part of the seed, so to get identical seeds
+            # we must set a context.
+            mx.random.seed(1234, ctx=ctx)
+            np.random.seed(1234)
+            tensor = mx.nd.random.uniform(-100, 100, shape=[size * 4] * dim,
+                                          ctx=ctx)
+            tensor = tensor.astype(dtype)
+            factor = np.random.uniform()
+            scaled = hvd.reducescatter(tensor, op=hvd.Sum, name=str(count),
+                                       prescale_factor=factor)
+
+            factor = mx.nd.array([factor], dtype='float64', ctx=ctx)
+            if ctx != mx.cpu() and not int(os.environ.get('HOROVOD_MIXED_INSTALL', 0)):
+                # For integer types, scaling done in FP64
+                factor = factor.astype('float64' if dtype in int_types else dtype)
+                tensor = tensor.astype('float64' if dtype in int_types else dtype)
+            else:
+                # For integer types, scaling done in FP64, FP32 math for FP16 on CPU
+                factor = factor.astype('float32' if dtype == 'float16' else
+                                       'float64' if dtype in int_types else dtype)
+                tensor = tensor.astype('float32' if dtype == 'float16' else
+                                       'float64' if dtype in int_types else dtype)
+
+            expected = factor * tensor[rank * 4:(rank + 1) * 4]
+            expected = expected.astype(dtype)
+            expected *= size
+            count += 1
+
+            # Threshold for floating point equality depends on number of
+            # ranks, since we're comparing against precise multiplication.
+            if size <= 3 or dtype in ['int32', 'int64']:
+                threshold = 0
+            elif size < 10:
+                threshold = 1e-4
+            elif size < 15:
+                threshold = 5e-4
+            else:
+                break
+
+            assert almost_equal(scaled.asnumpy(), expected.asnumpy(), atol=threshold), \
+                f'hvd.reducescatter produces incorrect results: {hvd.rank()} {count} {dtype} {dim}'
+
+    def test_horovod_reducescatter_postscale(self):
+        """Test that reducescatter correctly sums and scatters 1D, 2D, 3D tensors with postscaling."""
+        if hvd.ccl_built():
+            self.skipTest("Reducescatter is not supported yet with oneCCL operations.")
+        if _is_mac and hvd.gloo_built() and not hvd.mpi_built():
+            self.skipTest("ReducescatterGloo is not supported on macOS")
+        hvd.init()
+        size = hvd.size()
+        rank = hvd.rank()
+        dtypes = self.filter_supported_types(['int32',   'int64',
+                                              'float32', 'float64',
+                                              'float16'])
+        int_types = ['int32', 'int64']
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        count = 0
+        for dtype, dim in itertools.product(dtypes, dims):
+            # MXNet uses gpu_id as part of the seed, so to get identical seeds
+            # we must set a context.
+            mx.random.seed(1234, ctx=ctx)
+            np.random.seed(1234)
+            tensor = mx.nd.random.uniform(-100, 100, shape=[size * 4] * dim,
+                                          ctx=ctx)
+            tensor = tensor.astype(dtype)
+            factor = np.random.uniform()
+            scaled = hvd.reducescatter(tensor, op=hvd.Sum, name=str(count),
+                                       postscale_factor=factor)
+
+            factor = mx.nd.array([factor], dtype='float64', ctx=ctx)
+            if ctx != mx.cpu() and not int(os.environ.get('HOROVOD_MIXED_INSTALL', 0)):
+                # For integer types, scaling done in FP64
+                factor = factor.astype('float64' if dtype in int_types else dtype)
+                tensor = tensor.astype('float64' if dtype in int_types else dtype)
+            else:
+                # For integer types, scaling done in FP64, FP32 math for FP16 on CPU
+                factor = factor.astype('float32' if dtype == 'float16' else
+                                       'float64' if dtype in int_types else dtype)
+                tensor = tensor.astype('float32' if dtype == 'float16' else
+                                       'float64' if dtype in int_types else dtype)
+
+            expected = tensor[rank * 4:(rank + 1) * 4] * size
+            expected *= factor
+            expected = expected.astype(dtype)
+            count += 1
+
+            # Threshold for floating point equality depends on number of
+            # ranks, since we're comparing against precise multiplication.
+            if size <= 3 or dtype in ['int32', 'int64']:
+                threshold = 0
+            elif size < 10:
+                threshold = 1e-4
+            elif size < 15:
+                threshold = 5e-4
+            else:
+                break
+
+            assert almost_equal(scaled.asnumpy(), expected.asnumpy(), atol=threshold), \
+                f'hvd.reducescatter produces incorrect results: {hvd.rank()} {count} {dtype} {dim}'
+
+    def test_horovod_reducescatter_scalar_error(self):
+        if hvd.ccl_built():
+            self.skipTest("Reducescatter is not supported yet with oneCCL operations.")
+        if _is_mac and hvd.gloo_built() and not hvd.mpi_built():
+            self.skipTest("ReducescatterGloo is not supported on macOS")
+        hvd.init()
+        size = hvd.size()
+        rank = hvd.rank()
+        ctx = self._current_context()
+        scalar = mx.nd.array(rank, dtype=np.float32, ctx=ctx)
+        with self.assertRaises(ValueError):
+            _ = hvd.reducescatter(scalar, op=hvd.Average)
+
+    def test_horovod_reducescatter_error(self):
+        """Test that the reducescatter raises an error if different ranks try to
+        send tensors of different rank or dimension."""
+        if hvd.ccl_built():
+            self.skipTest("Reducescatter is not supported yet with oneCCL operations.")
+        if _is_mac and hvd.gloo_built() and not hvd.mpi_built():
+            self.skipTest("ReducescatterGloo is not supported on macOS")
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        if size == 1:
+            self.skipTest("This test does not apply if there is only one worker.")
+
+        # Same rank, different dimension
+        ctx = self._current_context()
+
+        shape = (17 + rank, 3)
+        tensor = mx.nd.ones(shape=shape, ctx=ctx)
+        try:
+            output = hvd.reducescatter(tensor)
+            output.wait_to_read()
+            assert False, 'hvd.reducescatter did not throw error'
+        except (MXNetError, RuntimeError):
+            pass
+
+        # Same number of elements, different rank
+        if rank == 0:
+            shape = (17, 23 * 57)
+        else:
+            shape = (17, 23, 57)
+        tensor = mx.nd.ones(shape=shape, ctx=ctx)
+        try:
+            output = hvd.reducescatter(tensor)
+            output.wait_to_read()
+            assert False, 'hvd.reducescatter did not throw error'
+        except (MXNetError, RuntimeError):
+            pass
+
+    def test_horovod_reducescatter_process_sets(self):
+        """Test that reducescatter correctly sums and scatters 1D, 2D, 3D tensors if restricted
+        to non-global process sets."""
+        if hvd.ccl_built():
+            self.skipTest("Reducescatter is not supported yet with oneCCL operations.")
+        if _is_mac and hvd.gloo_built() and not hvd.mpi_built():
+            self.skipTest("ReducescatterGloo is not supported on macOS")
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        even_ranks = [rk for rk in range(0, size) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, size) if rk % 2 == 1]
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+        if rank in even_ranks:
+            this_set = even_set
+        if rank in odd_ranks:
+            this_set = odd_set
+
+        dtypes = self.filter_supported_types(['int32',   'int64',
+                                              'float32', 'float64', 'float16'])
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        count = 0
+        for dtype, dim in itertools.product(dtypes, dims):
+            # MXNet uses gpu_id as part of the seed, so to get identical seeds
+            # we must set a context.
+            mx.random.seed(1234, ctx=ctx)
+            even_rank_tensor = mx.nd.random.uniform(-100, 100, shape=[len(even_ranks) * 4] * dim,
+                                                    ctx=ctx)
+            odd_rank_tensor = mx.nd.random.uniform(-100, 100, shape=[len(odd_ranks) * 4] * dim,
+                                                   ctx=ctx)
+            if rank in even_ranks:
+                tensor = even_rank_tensor.astype(dtype)
+            elif rank in odd_ranks:
+                tensor = odd_rank_tensor.astype(dtype)
+            summed = hvd.reducescatter(tensor, op=hvd.Sum, name=str(count), process_set=this_set)
+            expected = tensor[this_set.rank() * 4:(this_set.rank() + 1) * 4] * this_set.size()
+
+            count += 1
+
+            # Threshold for floating point equality depends on number of
+            # ranks, since we're comparing against precise multiplication.
+            max_process_set_size = max(len(even_ranks), len(odd_ranks))
+            if max_process_set_size <= 3 or dtype in ['int32', 'int64']:
+                threshold = 0
+            elif max_process_set_size < 10:
+                threshold = 1e-4
+            elif max_process_set_size < 15:
+                threshold = 5e-4
+            else:
+                break
+
+            assert almost_equal(summed.asnumpy(), expected.asnumpy(), atol=threshold), \
+                f'hvd.reducescatter produces incorrect results: {hvd.rank()} {count} {dtype} {dim}'
+
+        hvd.remove_process_set(odd_set)
+        hvd.remove_process_set(even_set)
+
+    def test_horovod_grouped_reducescatter(self):
+        """Test that the grouped reducescatter correctly sums and scatters 1D, 2D, 3D tensors."""
+        if hvd.ccl_built():
+            self.skipTest("Reducescatter is not supported yet with oneCCL operations.")
+        if _is_mac and hvd.gloo_built() and not hvd.mpi_built():
+            self.skipTest("ReducescatterGloo is not supported on macOS")
+        hvd.init()
+        size = hvd.size()
+        rank = hvd.rank()
+        dtypes = self.filter_supported_types(['int32',   'int64',
+                                              'float32', 'float64',
+                                              'float16'])
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        count = 0
+        for dtype, dim in itertools.product(dtypes, dims):
+            # MXNet uses gpu_id as part of the seed, so to get identical seeds
+            # we must set a context.
+            mx.random.seed(1234, ctx=ctx)
+            tensors = [mx.nd.random.uniform(-100, 100, shape=[size * 4] * dim,
+                                            ctx=ctx) for _ in range(5)]
+            tensors = [t.astype(dtype) for t in tensors]
+            summed = hvd.grouped_reducescatter(tensors, op=hvd.Sum, name=str(count))
+            expected = [t[rank * 4:(rank + 1) * 4] * size for t in tensors]
+            count += 1
+
+            # Threshold for floating point equality depends on number of
+            # ranks, since we're comparing against precise multiplication.
+            if size <= 3 or dtype in ['int32', 'int64']:
+                threshold = 0
+            elif size < 10:
+                threshold = 1e-4
+            elif size < 15:
+                threshold = 5e-4
+            else:
+                break
+
+            assert all(almost_equal(t1.asnumpy(), t2.asnumpy(), atol=threshold) for t1, t2 in zip(summed, expected)), \
+                f'hvd.grouped_reducescatter produces incorrect results: {hvd.rank()} {count} {dtype} {dim}'
+
+    def test_horovod_grouped_reducescatter_average(self):
+        """Test that the grouped reducescatter correctly averages and scatters 1D, 2D, 3D tensors."""
+        if hvd.ccl_built():
+            self.skipTest("Reducescatter is not supported yet with oneCCL operations.")
+        if _is_mac and hvd.gloo_built() and not hvd.mpi_built():
+            self.skipTest("ReducescatterGloo is not supported on macOS")
+        hvd.init()
+        size = hvd.size()
+        rank = hvd.rank()
+        dtypes = self.filter_supported_types(['int32',   'int64',
+                                              'float32', 'float64',
+                                              'float16'])
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        count = 0
+        for dtype, dim in itertools.product(dtypes, dims):
+            # MXNet uses gpu_id as part of the seed, so to get identical seeds
+            # we must set a context.
+            mx.random.seed(1234, ctx=ctx)
+            tensors = [mx.nd.random.uniform(-100, 100, shape=[size * 4] * dim,
+                                            ctx=ctx) for _ in range(5)]
+            tensors = [t.astype(dtype) for t in tensors]
+            averaged = hvd.grouped_reducescatter(tensors, op=hvd.Average, name=str(count))
+            expected = [t[rank * 4:(rank + 1) * 4] for t in tensors]
+            count += 1
+
+            # Threshold for floating point equality depends on number of
+            # ranks, since we're comparing against precise multiplication.
+            if size <= 3 or dtype in ['int32', 'int64']:
+                threshold = 0
+            elif size < 10:
+                threshold = 1e-4
+            elif size < 15:
+                threshold = 5e-4
+            else:
+                break
+
+            assert all(almost_equal(t1.asnumpy(), t2.asnumpy(), atol=threshold) for t1, t2 in zip(averaged, expected)), \
+                f'hvd.grouped_reducescatter produces incorrect results: {hvd.rank()} {count} {dtype} {dim}'
+
+    def test_horovod_grouped_reducescatter_prescale(self):
+        """Test that grouped reducescatter correctly sums and scatters 1D, 2D, 3D tensors with prescaling."""
+        if hvd.ccl_built():
+            self.skipTest("Reducescatter is not supported yet with oneCCL operations.")
+        if _is_mac and hvd.gloo_built() and not hvd.mpi_built():
+            self.skipTest("ReducescatterGloo is not supported on macOS")
+        hvd.init()
+        size = hvd.size()
+        rank = hvd.rank()
+        dtypes = self.filter_supported_types(['int32',   'int64',
+                                              'float32', 'float64',
+                                              'float16'])
+        int_types = ['int32', 'int64']
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        count = 0
+        for dtype, dim in itertools.product(dtypes, dims):
+            # MXNet uses gpu_id as part of the seed, so to get identical seeds
+            # we must set a context.
+            mx.random.seed(1234, ctx=ctx)
+            np.random.seed(1234)
+            tensors = [mx.nd.random.uniform(-100, 100, shape=[size * 4] * dim,
+                                            ctx=ctx) for _ in range(5)]
+            tensors = [t.astype(dtype) for t in tensors]
+            factor = np.random.uniform()
+            scaled = hvd.grouped_reducescatter(tensors, op=hvd.Sum, name=str(count),
+                                               prescale_factor=factor)
+
+            factor = mx.nd.array([factor], dtype='float64', ctx=ctx)
+            if ctx != mx.cpu() and not int(os.environ.get('HOROVOD_MIXED_INSTALL', 0)):
+                # For integer types, scaling done in FP64
+                factor = factor.astype('float64' if dtype in int_types else dtype)
+                tensors = [t.astype('float64' if dtype in int_types else dtype) for t in tensors]
+            else:
+                # For integer types, scaling done in FP64, FP32 math for FP16 on CPU
+                factor = factor.astype('float32' if dtype == 'float16' else
+                                       'float64' if dtype in int_types else dtype)
+                tensors = [t.astype('float32' if dtype == 'float16' else
+                                    'float64' if dtype in int_types else dtype) for t in tensors]
+
+            expected = [factor * t[rank * 4:(rank + 1) * 4] for t in tensors]
+            expected = [e.astype(dtype) for e in expected]
+            expected = [e * size for e in expected]
+            count += 1
+
+            # Threshold for floating point equality depends on number of
+            # ranks, since we're comparing against precise multiplication.
+            if size <= 3 or dtype in ['int32', 'int64']:
+                threshold = 0
+            elif size < 10:
+                threshold = 1e-4
+            elif size < 15:
+                threshold = 5e-4
+            else:
+                break
+
+            assert all(almost_equal(t1.asnumpy(), t2.asnumpy(), atol=threshold) for t1, t2 in zip(scaled, expected)), \
+                f'hvd.grouped_reducescatter produces incorrect results: {hvd.rank()} {count} {dtype} {dim}'
+
+
+    def test_horovod_grouped_reducescatter_postscale(self):
+        """Test that grouped reducescatter correctly sums and scatters 1D, 2D, 3D tensors with postscaling."""
+        if hvd.ccl_built():
+            self.skipTest("Reducescatter is not supported yet with oneCCL operations.")
+        if _is_mac and hvd.gloo_built() and not hvd.mpi_built():
+            self.skipTest("ReducescatterGloo is not supported on macOS")
+        hvd.init()
+        size = hvd.size()
+        rank = hvd.rank()
+        dtypes = self.filter_supported_types(['int32',   'int64',
+                                              'float32', 'float64',
+                                              'float16'])
+        int_types = ['int32', 'int64']
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        count = 0
+        for dtype, dim in itertools.product(dtypes, dims):
+            # MXNet uses gpu_id as part of the seed, so to get identical seeds
+            # we must set a context.
+            mx.random.seed(1234, ctx=ctx)
+            np.random.seed(1234)
+            tensors = [mx.nd.random.uniform(-100, 100, shape=[size * 4] * dim,
+                                            ctx=ctx) for _ in range(5)]
+            tensors = [t.astype(dtype) for t in tensors]
+            factor = np.random.uniform()
+            scaled = hvd.grouped_reducescatter(tensors, op=hvd.Sum, name=str(count),
+                                               postscale_factor=factor)
+
+            factor = mx.nd.array([factor], dtype='float64', ctx=ctx)
+            if ctx != mx.cpu() and not int(os.environ.get('HOROVOD_MIXED_INSTALL', 0)):
+                # For integer types, scaling done in FP64
+                factor = factor.astype('float64' if dtype in int_types else dtype)
+                tensors = [t.astype('float64' if dtype in int_types else dtype) for t in tensors]
+            else:
+                # For integer types, scaling done in FP64, FP32 math for FP16 on CPU
+                factor = factor.astype('float32' if dtype == 'float16' else
+                                       'float64' if dtype in int_types else dtype)
+                tensors = [t.astype('float32' if dtype == 'float16' else
+                                    'float64' if dtype in int_types else dtype) for t in tensors]
+
+            expected = [t[rank * 4:(rank + 1) * 4] * size for t in tensors]
+            expected = [e * factor for e in expected]
+            expected = [e.astype(dtype) for e in expected]
+            count += 1
+
+            # Threshold for floating point equality depends on number of
+            # ranks, since we're comparing against precise multiplication.
+            if size <= 3 or dtype in ['int32', 'int64']:
+                threshold = 0
+            elif size < 10:
+                threshold = 1e-4
+            elif size < 15:
+                threshold = 5e-4
+            else:
+                break
+
+            assert all(almost_equal(t1.asnumpy(), t2.asnumpy(), atol=threshold) for t1, t2 in zip(scaled, expected)), \
+                f'hvd.grouped_reducescatter produces incorrect results: {hvd.rank()} {count} {dtype} {dim}'
+
+    def test_horovod_grouped_reducescatter_scalar_error(self):
+        if hvd.ccl_built():
+            self.skipTest("Reducescatter is not supported yet with oneCCL operations.")
+        if _is_mac and hvd.gloo_built() and not hvd.mpi_built():
+            self.skipTest("ReducescatterGloo is not supported on macOS")
+        hvd.init()
+        rank = hvd.rank()
+        ctx = self._current_context()
+        tensor_and_scalar = [mx.nd.zeros((3,1), ctx=ctx, dtype=np.float32),
+                             mx.nd.array(rank, dtype=np.float32, ctx=ctx)]
+        with self.assertRaises(ValueError):
+            _ = hvd.grouped_reducescatter(tensor_and_scalar, op=hvd.Average)
+
+    def test_horovod_grouped_reducescatter_process_sets(self):
+        """Test that grouped reducescatter correctly sums and scatters 1D, 2D, 3D tensors if restricted
+        to non-global process sets."""
+        if hvd.ccl_built():
+            self.skipTest("Reducescatter is not supported yet with oneCCL operations.")
+        if _is_mac and hvd.gloo_built() and not hvd.mpi_built():
+            self.skipTest("ReducescatterGloo is not supported on macOS")
+        hvd.init()
+        rank = hvd.rank()
+        size = hvd.size()
+
+        even_ranks = [rk for rk in range(0, size) if rk % 2 == 0]
+        odd_ranks = [rk for rk in range(0, size) if rk % 2 == 1]
+        even_set = hvd.add_process_set(even_ranks)
+        odd_set = hvd.add_process_set(odd_ranks)
+        if rank in even_ranks:
+            this_set = even_set
+        if rank in odd_ranks:
+            this_set = odd_set
+
+        dtypes = self.filter_supported_types(['int32',   'int64',
+                                              'float32', 'float64', 'float16'])
+        dims = [1, 2, 3]
+        ctx = self._current_context()
+        count = 0
+        for dtype, dim in itertools.product(dtypes, dims):
+            # MXNet uses gpu_id as part of the seed, so to get identical seeds
+            # we must set a context.
+            mx.random.seed(1234, ctx=ctx)
+            even_rank_tensors = [mx.nd.random.uniform(-100, 100, shape=[len(even_ranks) * 4] * dim,
+                                                      ctx=ctx) for _ in range(5)]
+            odd_rank_tensors = [mx.nd.random.uniform(-100, 100, shape=[len(odd_ranks) * 4] * dim,
+                                                     ctx=ctx) for _ in range(5)]
+            if rank in even_ranks:
+                tensors = [t.astype(dtype) for t in even_rank_tensors]
+            elif rank in odd_ranks:
+                tensors = [t.astype(dtype) for t in odd_rank_tensors]
+            summed = hvd.grouped_reducescatter(tensors, op=hvd.Sum, name=str(count), process_set=this_set)
+            expected = [t[this_set.rank() * 4:(this_set.rank() + 1) * 4] * this_set.size()
+                        for t in tensors]
+
+            count += 1
+
+            # Threshold for floating point equality depends on number of
+            # ranks, since we're comparing against precise multiplication.
+            max_process_set_size = max(len(even_ranks), len(odd_ranks))
+            if max_process_set_size <= 3 or dtype in ['int32', 'int64']:
+                threshold = 0
+            elif max_process_set_size < 10:
+                threshold = 1e-4
+            elif max_process_set_size < 15:
+                threshold = 5e-4
+            else:
+                break
+
+            assert all(almost_equal(t1.asnumpy(), t2.asnumpy(), atol=threshold)
+                       for t1, t2 in zip(summed, expected)), \
+                f'hvd.grouped_reducescatter produces incorrect results: {hvd.rank()} {count} {dtype} {dim}'
 
         hvd.remove_process_set(odd_set)
         hvd.remove_process_set(even_set)

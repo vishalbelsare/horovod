@@ -22,7 +22,7 @@ import shutil
 import tempfile
 import warnings
 
-from distutils.version import LooseVersion
+from packaging import version
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -30,6 +30,7 @@ import pyarrow.parquet as pq
 import fsspec
 from fsspec.core import split_protocol
 from fsspec.utils import update_storage_options
+from fsspec.callbacks import _DEFAULT_CALLBACK
 
 from horovod.spark.common.util import is_databricks, host_hash
 
@@ -167,7 +168,8 @@ class AbstractFilesystemStore(Store):
     """Abstract class for stores that use a filesystem for underlying storage."""
 
     def __init__(self, prefix_path, train_path=None, val_path=None, test_path=None,
-            runs_path=None, save_runs=True, storage_options=None, **kwargs):
+            runs_path=None, save_runs=True, storage_options=None, checkpoint_filename=None,
+            **kwargs):
         self.prefix_path = self.get_full_path(prefix_path)
         self._train_path = self._get_full_path_or_default(train_path, 'intermediate_train_data')
         self._val_path = self._get_full_path_or_default(val_path, 'intermediate_val_data')
@@ -175,6 +177,7 @@ class AbstractFilesystemStore(Store):
         self._runs_path = self._get_full_path_or_default(runs_path, 'runs')
         self._save_runs = save_runs
         self.storage_options = storage_options
+        self.checkpoint_filename = checkpoint_filename if checkpoint_filename else 'checkpoint'
         super().__init__()
 
     def exists(self, path):
@@ -199,7 +202,7 @@ class AbstractFilesystemStore(Store):
         from tensorflow import keras
         from horovod.spark.keras.util import TFKerasUtil
 
-        if LooseVersion(tensorflow.__version__) < LooseVersion("2.0.0"):
+        if version.parse(tensorflow.__version__) < version.parse("2.0.0"):
             model_bytes = self.read(ckpt_path)
             return codec.dumps_base64(model_bytes)
         else:
@@ -248,7 +251,7 @@ class AbstractFilesystemStore(Store):
         return os.path.join(self.get_runs_path(), run_id)
 
     def get_checkpoint_path(self, run_id):
-        return os.path.join(self.get_run_path(run_id), self.get_checkpoint_filename()) \
+        return self.get_run_path(run_id) \
             if self._save_runs else None
 
     def get_checkpoints(self, run_id, suffix='.ckpt'):
@@ -261,7 +264,7 @@ class AbstractFilesystemStore(Store):
             if self._save_runs else None
 
     def get_checkpoint_filename(self):
-        return 'checkpoint'
+        return self.checkpoint_filename
 
     def get_logs_subdir(self):
         return 'logs'
@@ -302,7 +305,7 @@ class FilesystemStore(AbstractFilesystemStore):
         self.storage_options = kwargs['storage_options'] if 'storage_options' in kwargs else {}
         self.prefix_path = prefix_path
         self._fs, self.protocol = self._get_fs_and_protocol()
-        std_params = ['train_path', 'val_path', 'test_path', 'runs_path', 'save_runs', 'storage_options'] 
+        std_params = ['train_path', 'val_path', 'test_path', 'runs_path', 'save_runs', 'storage_options']
         params = dict((k, kwargs[k]) for k in std_params if k in kwargs)
         super().__init__(prefix_path, *args, **params)
 
@@ -311,9 +314,37 @@ class FilesystemStore(AbstractFilesystemStore):
 
         def fn(local_run_path):
             print(f"Syncing dir {local_run_path} to dir {run_path}")
-            self.fs.put(local_run_path, run_path, recursive=True, overwrite=True)
+            self.copy(local_run_path, run_path, recursive=True, overwrite=True)
 
         return fn
+
+    def copy(self, lpath, rpath, recursive=False, callback=_DEFAULT_CALLBACK,**kwargs):
+        """
+        This method copies the contents of the local source directory to the target directory.
+        This is different from the fsspec's put() because it does not copy the source folder
+        to the target directory in the case when target directory already exists.
+        """
+
+        from fsspec.implementations.local import LocalFileSystem, make_path_posix
+        from fsspec.utils import other_paths
+
+        rpath = (
+            self.fs._strip_protocol(rpath)
+            if isinstance(rpath, str)
+            else [self.fs._strip_protocol(p) for p in rpath]
+        )
+        if isinstance(lpath, str):
+            lpath = make_path_posix(lpath)
+        fs = LocalFileSystem()
+        lpaths = fs.expand_path(lpath, recursive=recursive)
+        rpaths = other_paths(
+            lpaths, rpath
+        )
+
+        callback.set_size(len(rpaths))
+        for lpath, rpath in callback.wrap(zip(lpaths, rpaths)):
+            callback.branch(lpath, rpath, kwargs)
+            self.fs.put_file(lpath, rpath, **kwargs)
 
     def get_filesystem(self):
         return self.fs
@@ -398,7 +429,7 @@ class HDFSStore(AbstractFilesystemStore):
                                  user=user,
                                  kerb_ticket=kerb_ticket,
                                  extra_conf=extra_conf)
-        if LooseVersion(pa.__version__) < LooseVersion('0.17.0'):
+        if version.parse(pa.__version__) < version.parse('0.17.0'):
             self._hdfs_kwargs['driver'] = driver
         self._hdfs = self._get_filesystem_fn()()
 
@@ -490,7 +521,7 @@ class HDFSStore(AbstractFilesystemStore):
 
         if not path:
             raise ValueError('Failed to parse path from URL: {}'.format(url))
-    
+
     def get_localized_path(self, path):
         if self.matches(path):
             return path[len(self._url_prefix):]
@@ -501,34 +532,67 @@ class HDFSStore(AbstractFilesystemStore):
         return path.startswith(cls.FS_PREFIX)
 
 
+# If `_DBFS_PREFIX_MAPPING` is not None, map `/dbfs/...` path to `{_DBFS_PREFIX_MAPPING}/...`
+# This is used in testing, and this mapping only applies to `DBFSLocalStore.get_localized_path`
+_DBFS_PREFIX_MAPPING = None
+
+
 class DBFSLocalStore(FilesystemStore):
     """Uses Databricks File System (DBFS) local file APIs as a store of intermediate data and
     training artifacts.
 
-    Initialized from a `prefix_path` starts with `/dbfs/...`, `file:///dbfs/...` or `dbfs:/...`, see
+    Initialized from a `prefix_path` starts with `/dbfs/...`, `file:///dbfs/...`, `file:/dbfs/...`
+    or `dbfs:/...`, see
     https://docs.databricks.com/data/databricks-file-system.html#local-file-apis.
     """
+
+    DBFS_PATH_FORMAT_ERROR = "The provided path is not a DBFS path: {}, Please provide a path " \
+                             "starting with `/dbfs/...` or `dbfs:/...` or `file:/dbfs/...` or " \
+                             "`file:///dbfs/...`."
+
     def __init__(self, prefix_path, *args, **kwargs):
         prefix_path = self.normalize_path(prefix_path)
-        if not prefix_path.startswith("/dbfs/"):
-            warnings.warn("The provided prefix_path might be ephemeral: {} Please provide a "
-                          "`prefix_path` starting with `/dbfs/...`".format(prefix_path))
+        if not DBFSLocalStore.matches_dbfs(prefix_path):
+            raise ValueError(DBFSLocalStore.DBFS_PATH_FORMAT_ERROR.format(prefix_path))
         super(DBFSLocalStore, self).__init__(prefix_path, *args, **kwargs)
 
     @classmethod
     def matches_dbfs(cls, path):
-        return path.startswith("dbfs:/") or path.startswith("/dbfs/") or path.startswith("file:///dbfs/")
+        return (path.startswith("dbfs:/") and not path.startswith("dbfs://")) or \
+               path.startswith("/dbfs/") or \
+               path.startswith("file:///dbfs/") or \
+               path.startswith("file:/dbfs/")
 
     @staticmethod
     def normalize_path(path):
         """
         Normalize the path to the form `/dbfs/...`
         """
-        if path.startswith("dbfs:/"):
+        if path.startswith("dbfs:/") and not path.startswith("dbfs://"):
             return "/dbfs" + path[5:]
-        if path.startswith("file:///dbfs/"):
+        elif path.startswith("/dbfs/"):
+            return path
+        elif path.startswith("file:///dbfs/"):
             return path[7:]
-        return path
+        elif path.startswith("file:/dbfs/"):
+            return path[5:]
+        else:
+            raise ValueError(DBFSLocalStore.DBFS_PATH_FORMAT_ERROR.format(path))
+
+    def exists(self, path):
+        localized_path = self.get_localized_path(path)
+        return self.fs.exists(localized_path)
+
+    def get_localized_path(self, path):
+        local_path = DBFSLocalStore.normalize_path(path)
+        if _DBFS_PREFIX_MAPPING:
+            # this is for testing.
+            return os.path.join(_DBFS_PREFIX_MAPPING, path[6:])
+        else:
+            return local_path
+
+    def get_full_path(self, path):
+        return "file://" + DBFSLocalStore.normalize_path(path)
 
     def get_checkpoint_filename(self):
         # Use the default Tensorflow SavedModel format in TF 2.x. In TF 1.x, the SavedModel format
@@ -545,7 +609,7 @@ class DBFSLocalStore(FilesystemStore):
         from tensorflow import keras
         from horovod.spark.keras.util import TFKerasUtil
 
-        if LooseVersion(tensorflow.__version__) < LooseVersion("2.0.0"):
+        if version.parse(tensorflow.__version__) < version.parse("2.0.0"):
             model.load_weights(ckpt_path)
         else:
             with keras.utils.custom_object_scope(custom_objects):

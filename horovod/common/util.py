@@ -219,12 +219,12 @@ def get_average_backwards_compatibility_fun(reduce_ops):
     hvd.allreduce(tensor, average=False, op=hvd.Adasum)).
     """
     def impl(op, average):
-        if op != None:
-            if average != None:
+        if op is not None:
+            if average is not None:
                 raise ValueError('The op parameter supersedes average. Please provide only one of them.')
             return op
-        elif average != None:
-            warnings.warn('Parameter `average` has been replaced with `op` and will be removed in v0.21.0',
+        elif average is not None:
+            warnings.warn('Parameter `average` has been replaced with `op` and will be removed in v1.0',
                           DeprecationWarning)
             return reduce_ops.Average if average else reduce_ops.Sum
         else:
@@ -265,3 +265,24 @@ def is_iterable(x):
     except TypeError:
         return False
     return True
+
+
+@_cache
+def is_version_greater_equal_than(ver, target):
+    from packaging import version
+    if any([not isinstance(_str, str) for _str in (ver, target)]):
+        raise ValueError("This function only accepts string arguments. \n"
+                         "Received:\n"
+                         "\t- ver (type {type_ver}: {val_ver})"
+                         "\t- target (type {type_target}: {val_target})".format(
+                            type_ver=(type(ver)),
+                            val_ver=ver,
+                            type_target=(type(target)),
+                            val_target=target,
+                         ))
+
+    if len(target.split(".")) != 3:
+        raise ValueError("We only accepts target version values in the form "
+                         "of: major.minor.patch. Received: {}".format(target))
+
+    return version.parse(ver) >= version.parse(target)

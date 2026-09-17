@@ -20,6 +20,7 @@
 
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -33,9 +34,12 @@
 using gpuError_t = cudaError_t;
 using gpuEvent_t = cudaEvent_t;
 using gpuStream_t = cudaStream_t;
+using gpuPointerAttribute_t = cudaPointerAttributes;
 #define gpuEventCreateWithFlags cudaEventCreateWithFlags
 #define gpuEventDisableTiming cudaEventDisableTiming
 #define gpuEventRecord cudaEventRecord
+#define gpuEventQuery cudaEventQuery
+#define gpuErrorNotReady cudaErrorNotReady
 #define gpuEventSynchronize cudaEventSynchronize
 #define gpuStreamWaitEvent cudaStreamWaitEvent
 #define HVD_GPU_CHECK(x)                                                                    \
@@ -45,15 +49,17 @@ using gpuStream_t = cudaStream_t;
       throw std::logic_error(std::string("GPU Error:") + cudaGetErrorString(cuda_result));  \
     }                                                                                       \
   } while (0)
-#endif
 #elif HAVE_ROCM
 #include <hip/hip_runtime_api.h>
 using gpuError_t = hipError_t;
 using gpuEvent_t = hipEvent_t;
 using gpuStream_t = hipStream_t;
+using gpuPointerAttribute_t = hipPointerAttribute_t;
 #define gpuEventCreateWithFlags hipEventCreateWithFlags
 #define gpuEventDisableTiming hipEventDisableTiming
 #define gpuEventRecord hipEventRecord
+#define gpuEventQuery hipEventQuery
+#define gpuErrorNotReady hipErrorNotReady
 #define gpuEventSynchronize hipEventSynchronize
 #define gpuStreamWaitEvent hipStreamWaitEvent
 #define HVD_GPU_CHECK(x)                                                                  \
@@ -63,6 +69,7 @@ using gpuStream_t = hipStream_t;
       throw std::logic_error(std::string("GPU Error:") + hipGetErrorString(hip_result));  \
     }                                                                                     \
   } while (0)
+#endif
 #endif
 
 
@@ -83,6 +90,7 @@ namespace common {
 #define MEMCPY_IN_SHARED_BUFFER "MEMCPY_IN_SHARED_BUFFER"
 #define MPI_ALLREDUCE "MPI_ALLREDUCE"
 #define MPI_ADASUM_ALLREDUCE "MPI_ADASUM_ALLREDUCE"
+#define MPI_REDUCESCATTER "MPI_REDUCESCATTER"
 #define MEMCPY_OUT_HOST_BUFFER "MEMCPY_OUT_HOST_BUFFER"
 #define NCCL_ALLREDUCE "NCCL_ALLREDUCE"
 #define MEMCPY_OUT_FUSION_BUFFER "MEMCPY_OUT_FUSION_BUFFER"
@@ -102,6 +110,7 @@ namespace common {
 #define GLOO_ALLREDUCE "GLOO_ALLREDUCE"
 #define GLOO_ALLGATHER "GLOO_ALLGATHER"
 #define GLOO_BCAST "GLOO_BCAST"
+#define GLOO_REDUCESCATTER "GLOO_REDUCESCATTER"
 #define HOROVOD_ELASTIC "HOROVOD_ELASTIC"
 
 // Horovod knobs.
@@ -121,6 +130,7 @@ namespace common {
 #define HOROVOD_STALL_SHUTDOWN_TIME_SECONDS "HOROVOD_STALL_SHUTDOWN_TIME_SECONDS"
 #define HOROVOD_HIERARCHICAL_ALLREDUCE "HOROVOD_HIERARCHICAL_ALLREDUCE"
 #define HOROVOD_HIERARCHICAL_ALLGATHER "HOROVOD_HIERARCHICAL_ALLGATHER"
+#define HOROVOD_TORUS_ALLREDUCE "HOROVOD_TORUS_ALLREDUCE"
 #define HOROVOD_CACHE_CAPACITY "HOROVOD_CACHE_CAPACITY"
 #define HOROVOD_BATCH_D2D_MEMCOPIES "HOROVOD_BATCH_D2D_MEMCOPIES"
 #define HOROVOD_NUM_NCCL_STREAMS "HOROVOD_NUM_NCCL_STREAMS"
@@ -323,9 +333,11 @@ public:
   AllocatePersistent(int64_t size,
                      std::shared_ptr<PersistentBuffer>* tensor) = 0;
   virtual Status AllocateOutput(TensorShape shape,
-                                std::shared_ptr<Tensor>* tensor) = 0;
+                                std::shared_ptr<Tensor>* tensor,
+                                std::shared_ptr<ReadyEvent>* event = nullptr) = 0;
   virtual Status AllocateOutput(int output_index, TensorShape shape,
-                                std::shared_ptr<Tensor>* tensor) {
+                                std::shared_ptr<Tensor>* tensor,
+                                std::shared_ptr<ReadyEvent>* event = nullptr) {
     if (output_index == 0) {
       return AllocateOutput(std::move(shape), tensor);
     } else {
@@ -354,6 +366,9 @@ struct TensorTableEntry {
   std::shared_ptr<Tensor> tensor;
   // Pre-allocated output tensor.
   std::shared_ptr<Tensor> output;
+  // Grouped Allgather ops will need to allocate memory for a specific
+  // output_index >= 0.
+  int32_t output_index = 0;
   // Identifier for the subset of Horovod processes partaking in this operation.
   int32_t process_set_id = 0;
   // Root rank for broadcast operation (relative to process set).

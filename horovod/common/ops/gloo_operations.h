@@ -27,7 +27,8 @@ namespace common {
 
 class IGlooAlgorithms {
 public:
-  virtual void Allreduce(void* buffer_data, int num_elements) = 0;
+  virtual void Allreduce(void* buffer_data, int num_elements,
+                         ReduceOp reduce_op) = 0;
 
   virtual void Allgather(void* buffer_data, void* buffer_out, int* recvcounts,
                          int* displcmnts) = 0;
@@ -39,16 +40,20 @@ public:
                         std::vector<int64_t>& sendcounts,
                         std::vector<int64_t>& recvcounts) = 0;
 
+  virtual void Reducescatter(void* buffer_data,
+                             std::vector<int>& recvcounts) = 0;
+
   virtual int ElementSize() const = 0;
+
+  virtual ~IGlooAlgorithms() = default;
 };
 
 template <typename T> class GlooAlgorithms : public IGlooAlgorithms {
 public:
   explicit GlooAlgorithms(GlooContext* gloo_context);
 
-  ~GlooAlgorithms() = default;
-
-  void Allreduce(void* buffer_data, int num_elements) override;
+  void Allreduce(void* buffer_data, int num_elements,
+                 ReduceOp reduce_op) override;
 
   void Allgather(void* buffer_data, void* buffer_out, int* recvcounts,
                  int* displcmnts) override;
@@ -59,6 +64,8 @@ public:
                 std::vector<int64_t>& sendcounts,
                 std::vector<int64_t>& recvcounts) override;
 
+  void Reducescatter(void* buffer_data, std::vector<int>& recvcounts) override;
+
   int ElementSize() const override;
 
 private:
@@ -68,8 +75,6 @@ private:
 class GlooAllreduce : public AllreduceOp {
 public:
   explicit GlooAllreduce(HorovodGlobalState* global_state);
-
-  virtual ~GlooAllreduce() = default;
 
   Status Execute(std::vector<TensorTableEntry>& entries,
                  const Response& response) override;
@@ -114,6 +119,19 @@ public:
                const std::vector<TensorTableEntry>& entries,
                const Response& response) const override;
 };
+
+class GlooReducescatter : public ReducescatterOp {
+public:
+  explicit GlooReducescatter(HorovodGlobalState* global_state);
+
+  Status Execute(std::vector<TensorTableEntry>& entries,
+                 const Response& response) override;
+
+  bool Enabled(const ParameterManager& param_manager,
+               const std::vector<TensorTableEntry>& entries,
+               const Response& response) const override;
+};
+
 
 } // namespace common
 } // namespace horovod

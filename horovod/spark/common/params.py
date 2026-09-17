@@ -1,4 +1,5 @@
 # Copyright 2019 Uber Technologies, Inc. All Rights Reserved.
+# Modifications copyright (C) 2022, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -53,6 +54,10 @@ class EstimatorParams(Params):
                          typeConverter=TypeConverters.toListString)
     label_cols = Param(Params._dummy(), 'label_cols', 'label column names',
                        typeConverter=TypeConverters.toListString)
+    continuous_cols = Param(Params._dummy(), "continuous_cols", "continuous column names",
+                        typeConverter=TypeConverters.toListString)
+    categorical_cols = Param(Params._dummy(), "categorical_cols", "categorical column names",
+                        typeConverter=TypeConverters.toListString)
     validation = Param(Params._dummy(), 'validation',
                        'one of: float validation split [0, 1), or string validation column name')
     callbacks = Param(Params._dummy(), 'callbacks', 'callbacks')
@@ -68,10 +73,19 @@ class EstimatorParams(Params):
                                        'number of steps (batches) for validation per epoch',
                                        typeConverter=TypeConverters.toInt)
 
+    random_seed = Param(Params._dummy(), 'random_seed',
+                        'random seed to use for DL frameworks',
+                        typeConverter=TypeConverters.toInt)
+
     shuffle_buffer_size = Param(Params._dummy(),
                                 'shuffle_buffer_size',
-                                'shuffling buffer size of data before training in number of samples',
+                                '(Deprecated) shuffling buffer size used for training samples',
                                 typeConverter=TypeConverters.toInt)
+
+    shuffle = Param(Params._dummy(),
+                    'shuffle',
+                    'Whether to shuffle training samples or not. Defaults to True',
+                    typeConverter=TypeConverters.toBoolean)
 
     verbose = Param(Params._dummy(), 'verbose', 'verbose flag (0=silent, 1=enabled, other values used by frameworks)',
                     typeConverter=TypeConverters.toInt)
@@ -90,7 +104,46 @@ class EstimatorParams(Params):
                               'function that applies custom transformations to '
                               'every batch before train and validation steps')
 
+    transformation_edit_fields = Param(Params._dummy(), 'transformation_edit_fields',
+                                       'edit fields for petastorm TransformSpec that\'s applied to '
+                                       'every batch, A list of 4-tuples with the following fields: '
+                                       '(name, numpy_dtype, shape, is_nullable)')
+
+    transformation_removed_fields = Param(Params._dummy(), 'transformation_removed_fields',
+                                       'removed fields for petastorm TransformSpec that\'s applied to '
+                                       'every batch, A list of field names that will be removed from the original schema.')
+
     label_shapes = Param(Params._dummy(), 'label_shapes', 'specifies the shape (or shapes) of the label column (or columns)')
+
+    inmemory_cache_all = Param(Params._dummy(), 'inmemory_cache_all',
+                               'Cache the data in memory for training and validation.',
+                               typeConverter=TypeConverters.toBoolean)
+
+    use_gpu = Param(Params._dummy(), 'use_gpu',
+                    'Whether to use the GPU for training. '
+                    'Setting this to False will skip binding to GPU even when GPU is available. '
+                    'Defaults to True.',
+                    typeConverter=TypeConverters.toBoolean)
+
+    mp_start_method = Param(Params._dummy(), 'mp_start_method',
+                    'The start method of multiprocessing. '
+                    'This controls the start up method of python multiprocessing. On unix-based systems, acceptable values are '
+                    '["fork", "spawn", "forkserver"]. Only "Spawn" is accepted on Windows. '
+                    'If not set, default values will be internally set by python, please refer to: '
+                    'https://docs.python.org/3/library/multiprocessing.html#multiprocessing.get_start_method.'
+                    'This param defaults to None.',
+                    typeConverter=TypeConverters.toString)
+
+    backward_passes_per_step = Param(Params._dummy(), 'backward_passes_per_step',
+                                     'Number of backward passes to perform before calling hvd.allreduce. '
+                                     'This allows accumulating updates over multiple mini-batches before reducing and applying them. '
+                                     'This param defaults to 1.',
+                                     typeConverter=TypeConverters.toInt)
+
+    tensorflow_dataset_prefetch_buffer_size = Param(Params._dummy(), 'tensorflow_dataset_prefetch_buffer_size',
+                                      'The size of the prefetch buffer for the TensorFlow dataset. '
+                                      'This param defaults to 0.',
+                                      typeConverter=TypeConverters.toInt)
 
     def __init__(self):
         super(EstimatorParams, self).__init__()
@@ -107,6 +160,8 @@ class EstimatorParams(Params):
             metrics=[],
             feature_cols=None,
             label_cols=None,
+            continuous_cols=None,
+            categorical_cols=None,
             validation=None,
             gradient_compression=None,
             compress_sparse_cols=False,
@@ -115,16 +170,25 @@ class EstimatorParams(Params):
             epochs=1,
             verbose=1,
             callbacks=[],
+            random_seed=None,
             shuffle_buffer_size=None,
+            shuffle=True,
             partitions_per_process=10,
             run_id=None,
             train_steps_per_epoch=None,
             validation_steps_per_epoch=None,
             transformation_fn=None,
+            transformation_edit_fields=None,
+            transformation_removed_fields=None,
             train_reader_num_workers=2,
             val_reader_num_workers=2,
-            reader_pool_type='process',
-            label_shapes=None)
+            reader_pool_type='thread',
+            label_shapes=None,
+            inmemory_cache_all=False,
+            use_gpu=True,
+            mp_start_method=None,
+            backward_passes_per_step=1,
+            tensorflow_dataset_prefetch_buffer_size=0)
 
     def _check_params(self, metadata):
         model = self.getModel()
@@ -209,6 +273,18 @@ class EstimatorParams(Params):
     def getLabelCols(self):
         return self.getOrDefault(self.label_cols)
 
+    def setContinuousCols(self, value):
+        return self._set(continuous_cols=value)
+
+    def getContinuousCols(self):
+        return self.getOrDefault(self.continuous_cols)
+
+    def setCategoricalCols(self, value):
+        return self._set(categorical_cols=value)
+
+    def getCategoricalCols(self):
+        return self.getOrDefault(self.categorical_cols)
+
     def setValidation(self, value):
         return self._set(validation=value)
 
@@ -269,11 +345,23 @@ class EstimatorParams(Params):
     def getCompressSparseCols(self):
         return self.getOrDefault(self.compress_sparse_cols)
 
+    def setRandomSeed(self, value):
+        return self._set(random_seed=value)
+
+    def getRandomSeed(self):
+        return self.getOrDefault(self.random_seed)
+
     def setShufflingBufferSize(self, value):
         return self._set(shuffle_buffer_size=value)
 
+    def setShuffle(self, value):
+        return self._set(shuffle=value)
+
     def getShufflingBufferSize(self):
         return self.getOrDefault(self.shuffle_buffer_size)
+
+    def getShuffle(self):
+        return self.getOrDefault(self.shuffle)
 
     def setOptimizer(self, value):
         return self._set(optimizer=value)
@@ -299,6 +387,18 @@ class EstimatorParams(Params):
     def getTransformationFn(self):
         return self.getOrDefault(self.transformation_fn)
 
+    def setTransformationEditFields(self, value):
+        return self._set(transformation_edit_fields=value)
+
+    def getTransformationEditFields(self):
+        return self.getOrDefault(self.transformation_edit_fields)
+
+    def setTransformationRemovedFields(self, value):
+        return self._set(transformation_removed_fields=value)
+
+    def getTransformationRemovedFields(self):
+        return self.getOrDefault(self.transformation_removed_fields)
+
     def setTrainReaderNumWorker(self, value):
         return self._set(train_reader_num_workers=value)
 
@@ -323,6 +423,35 @@ class EstimatorParams(Params):
     def getLabelShapes(self):
         return self.getOrDefault(self.label_shapes)
 
+    def setInMemoryCacheAll(self, value):
+        return self._set(inmemory_cache_all=value)
+
+    def getInMemoryCacheAll(self):
+        return self.getOrDefault(self.inmemory_cache_all)
+
+    def setUseGpu(self, value):
+        self._set(use_gpu=value)
+
+    def getUseGpu(self):
+        return self.getOrDefault(self.use_gpu)
+
+    def setMpStartMethod(self, value):
+        self._set(mp_start_method=value)
+
+    def getMpStartMethod(self):
+        return self.getOrDefault(self.mp_start_method)
+
+    def setBackwardPassesPerStep(self, value):
+        self._set(backward_passes_per_step=value)
+
+    def getBackwardPassesPerStep(self):
+        return self.getOrDefault(self.backward_passes_per_step)
+
+    def setTensorflowDatasetPrefetchBufferSize(self, value):
+        self._set(tensorflow_dataset_prefetch_buffer_size=value)
+
+    def getTensorflowDatasetPrefetchBufferSize(self):
+        return self.getOrDefault(self.tensorflow_dataset_prefetch_buffer_size)
 
 class ModelParams(HasOutputCols):
     history = Param(Params._dummy(), 'history', 'history')

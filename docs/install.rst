@@ -6,18 +6,24 @@ Horovod Installation Guide
 Requirements
 ------------
 
+- GNU Linux or macOS
 - Python >= 3.6
-- `g++-5` or above, or another compiler supporting C++14
-- CMake
-- TensorFlow, PyTorch, or MXNet
+- ``g++-5`` or above, or another compiler supporting C++14
+- CMake 3.13 or newer
+- TensorFlow (>=1.15.0), PyTorch (>=1.5.0), or MXNet (>=1.4.1)
 - (Optional) MPI
 
 For best performance on GPU:
 
 - `NCCL 2 <https://developer.nvidia.com/nccl>`__
 
-If Horovod in unable to find the CMake binary, you may need to set ``HOROVOD_CMAKE`` in your environment before
-installing.
+To install Horovod with TensorFlow 2.10 or later you will need a compiler that supports C++17 like ``g++8`` or newer.
+
+If Horovod cannot find CMake 3.13 or newer, the build script will attempt to pull in a recent CMake binary and run it
+from a temporary location.  To select a specific binary you can also set ``HOROVOD_CMAKE`` in your environment before
+installing Horovod.
+
+Horovod does not support Windows.
 
 Frameworks
 ----------
@@ -213,7 +219,7 @@ diagnose failures:
 Installing Horovod with Conda (+pip)
 ------------------------------------
 
-To use Conda to install PyTorch, TensorFlow, MXNet, Horovod, as well as GPU depdencies such as 
+To use Conda to install PyTorch, TensorFlow, MXNet, Horovod, as well as GPU dependencies such as
 NVIDIA CUDA Toolkit, cuDNN, NCCL, etc., see `Build a Conda Environment with GPU Support for Horovod <conda.rst>`_.
 
 Environment Variables
@@ -241,9 +247,11 @@ Possible values are given in curly brackets: {}.
 * ``HOROVOD_GPU_ALLREDUCE`` - {NCCL, MPI}. Framework to use for GPU tensor allreduce.
 * ``HOROVOD_GPU_ALLGATHER`` - {NCCL, MPI}. Framework to use for GPU tensor allgather.
 * ``HOROVOD_GPU_BROADCAST`` - {NCCL, MPI}. Framework to use for GPU tensor broadcast.
-* ``HOROVOD_ALLOW_MIXED_GPU_IMPL`` - {1}. Allow Horovod to install with NCCL allreduce and MPI GPU allgather / broadcast.  Not recommended due to a possible deadlock.
+* ``HOROVOD_GPU_ALLTOALL`` - {NCCL, MPI}. Framework to use for GPU tensor alltoall.
+* ``HOROVOD_GPU_REDUCESCATTER`` - {NCCL, MPI}. Framework to use for GPU tensor reducescatter.
+* ``HOROVOD_ALLOW_MIXED_GPU_IMPL`` - {1}. Allow Horovod to install with NCCL allreduce and MPI GPU allgather / broadcast / alltoall / reducescatter.  Not recommended due to a possible deadlock.
 * ``HOROVOD_CPU_OPERATIONS`` - {MPI, GLOO, CCL}. Framework to use for CPU tensor allreduce, allgather, and broadcast.
-* ``HOROVOD_CMAKE`` - path to the CMake binary used to build Gloo (not required when using MPI).
+* ``HOROVOD_CMAKE`` - path to the CMake binary used to build Horovod.
 * ``HOROVOD_WITH_TENSORFLOW`` - {1}. Require Horovod to install with TensorFlow support enabled.
 * ``HOROVOD_WITHOUT_TENSORFLOW`` - {1}. Skip installing TensorFlow support.
 * ``HOROVOD_WITH_PYTORCH`` - {1}. Require Horovod to install with PyTorch support enabled.

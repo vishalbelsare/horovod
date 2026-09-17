@@ -1,4 +1,5 @@
 # Copyright 2019 Uber Technologies, Inc. All Rights Reserved.
+# Modifications copyright (C) 2022, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,6 +20,7 @@ import copy
 import io
 import numbers
 import time
+import os
 
 from pyspark import keyword_only
 from pyspark.ml.param.shared import Param, Params, TypeConverters
@@ -32,6 +34,7 @@ from horovod.spark.common.params import EstimatorParams
 from horovod.spark.common.serialization import \
     HorovodParamsWriter, HorovodParamsReader
 from horovod.spark.torch import remote
+from horovod.spark.torch.datamodule import PetastormDataModule
 from horovod.spark.torch.util import deserialize_fn, serialize_fn, \
     save_into_bio
 
@@ -94,6 +97,7 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
 
     Args:
         num_proc: Number of Horovod processes.  Defaults to `spark.default.parallelism`.
+        data_module: (Optional) DataModule class used for training and validation, if not set, defaults to the PetastormDataModule.
         model: PyTorch model to train.
         backend: Optional Backend object for running distributed training function. Defaults to SparkBackend with
                  `num_proc` worker processes. Cannot be specified if `num_proc` is also provided.
@@ -107,6 +111,8 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
         gradient_compression: Gradient compression used by `hvd.DistributedOptimizer`.
         feature_cols: Column names used as feature inputs to the model. Must be a list with each feature
                       mapping to a sequential argument in the model's forward() function.
+        continuous_cols: Column names of all columns with continuous features.
+        categorical_cols: Column names of all columns with categorical features.
         input_shapes: List of shapes for each input tensor to the model.
         validation: Optional validation column name (string) where every row in the column is either 1/True or 0/False,
                     or validation split (float) giving percent of data to be randomly selected for validation.
@@ -115,9 +121,12 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
         val_batch_size: Number of rows from the DataFrame per batch for validation, if not set, will use batch_size.
         epochs: Number of epochs to train.
         verbose: Verbosity level [0, 2] (default: 1).
-        shuffle_buffer_size: Optional size of in-memory shuffle buffer in rows. Allocating a larger buffer size
-                             increases randomness of shuffling at the cost of more host memory. Defaults to estimating
-                             with an assumption of 4GB of memory per host.
+        random_seed: Optional random seed to use for Torch. Default: None.
+        shuffle_buffer_size: (Deprecated) Optional size of in-memory shuffle buffer in rows (on training data).
+                             Allocating a larger buffer size increases randomness of shuffling at
+                             the cost of more host memory. Defaults to estimating with an assumption
+                             of 4GB of memory per host. Set shuffle_buffer_size=0 would turn off shuffle.
+        shuffle: (Optional) Whether to shuffle training samples or not. Defaults to True.
         partitions_per_process: Number of Parquet partitions to assign per worker process from `num_proc` (default: 10).
         run_id: Optional unique ID for this run for organization in the Store. Will be automatically assigned if not
                 provided.
@@ -142,23 +151,27 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
                                high enough, or users need to apply transformation such as
                                decompression or data augmentation on raw data.
         val_reader_num_workers: Similar to the train_reader_num_workers.
-        reader_pool_type: Type of worker pool used to parallelize reading data from the dataset.
-                          Should be one of ['thread', 'process']. Defaults to 'process'.
+        reader_pool_type: Type of Petastorm worker pool used to parallelize reading data from the dataset.
+                          Should be one of ['thread', 'process', 'dummy']. Defaults to 'thread'.
+        inmemory_cache_all: (Optional) Cache the data in memory for training and validation.
+        use_gpu: Whether to use the GPU for training. Defaults to True.
+        mp_start_method: The method to use to start multiprocessing. Defaults to None.
+        backward_passes_per_step: Number of backward passes to perform before calling hvd.allreduce.
+                                  This allows accumulating updates over multiple mini-batches before
+                                  reducing and applying them. Defaults to 1.
     """
 
+    data_module = Param(Params._dummy(), 'data_module', 'data module class to use when reading data')
     input_shapes = Param(Params._dummy(), 'input_shapes', 'input layer shapes')
     loss_constructors = Param(Params._dummy(), 'loss_constructors',
                               'functions that construct the loss')
     train_minibatch_fn = Param(Params._dummy(), 'train_minibatch_fn',
                                'functions that construct the minibatch train function for torch')
 
-    inmemory_cache_all = Param(Params._dummy(), 'inmemory_cache_all',
-                               'Cache the data in memory for training and validation.',
-                               typeConverter=TypeConverters.toBoolean)
-
     @keyword_only
     def __init__(self,
                  num_proc=None,
+                 data_module=None,
                  model=None,
                  backend=None,
                  store=None,
@@ -170,6 +183,8 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
                  sample_weight_col=None,
                  gradient_compression=None,
                  feature_cols=None,
+                 continuous_cols=None,
+                 categorical_cols=None,
                  input_shapes=None,
                  validation=None,
                  label_cols=None,
@@ -178,7 +193,9 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
                  val_batch_size=None,
                  epochs=None,
                  verbose=1,
+                 random_seed=None,
                  shuffle_buffer_size=None,
+                 shuffle=True,
                  partitions_per_process=None,
                  run_id=None,
                  train_minibatch_fn=None,
@@ -187,23 +204,35 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
                  transformation_fn=None,
                  train_reader_num_workers=None,
                  val_reader_num_workers=None,
-                 reader_pool_type=None,
+                 reader_pool_type='thread',
                  label_shapes=None,
-                 inmemory_cache_all=False):
+                 inmemory_cache_all=False,
+                 use_gpu=True,
+                 mp_start_method=None,
+                 backward_passes_per_step=1):
 
         super(TorchEstimator, self).__init__()
-        self._setDefault(loss_constructors=None,
+        self._setDefault(data_module=PetastormDataModule,
+                         loss_constructors=None,
                          input_shapes=None,
                          train_minibatch_fn=None,
-                         transformation_fn=None,
-                         inmemory_cache_all=False)
+                         transformation_fn=None)
 
         kwargs = self._input_kwargs
 
         if EstimatorParams.loss.name in kwargs and TorchEstimator.loss_constructors.name in kwargs:
             raise ValueError("only one of loss_constructors and loss parameters can be specified.")
 
+        if backward_passes_per_step <= 0:
+            raise ValueError("backward_passes_per_step must be > 0")
+
         self.setParams(**kwargs)
+
+    def setDataModule(self, value):
+        return self._set(data_module=value)
+
+    def getDataModule(self):
+        return self.getOrDefault(self.data_module)
 
     def setTrainMinibatchFn(self, value):
         return self._set(train_minibatch_fn=value)
@@ -222,12 +251,6 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
 
     def getLossConstructors(self):
         return self.getOrDefault(self.loss_constructors)
-
-    def setInMemoryCacheAll(self, value):
-        return self._set(inmemory_cache_all=value)
-
-    def getInMemoryCacheAll(self):
-        return self.getOrDefault(self.inmemory_cache_all)
 
     def _get_optimizer(self):
         return self.getOrDefault(self.optimizer)
@@ -287,7 +310,10 @@ class TorchEstimator(HorovodEstimator, TorchEstimatorParamsWritable,
 
     def _load_checkpoint(self, run_id):
         store = self.getStore()
-        last_ckpt_path = store.get_checkpoint_path(run_id)
+        last_ckpt_path = os.path.join(store.get_checkpoint_path(run_id), store.get_checkpoint_filename())
+
+        if not store.fs.exists(last_ckpt_path):
+            return None
 
         if self.getVerbose():
             print('Resuming training from last checkpoint: {}'.format(last_ckpt_path))

@@ -91,7 +91,7 @@ def get_nvcc_bin():
                        'Make sure it is added to your path or in $HOROVOD_CUDA_HOME/bin.')
 
 def get_nvcc_flags():
-    default_flags = ['--std=c++11', '-O3', '-Xcompiler', '-fPIC']
+    default_flags = ['-O3', '-Xcompiler', '-fPIC']
     cc_list_env = os.environ.get('HOROVOD_BUILD_CUDA_CC_LIST')
 
     # Invoke nvcc and extract all supported compute capabilities for CUDA toolkit version
@@ -109,9 +109,10 @@ def get_nvcc_flags():
 
     # Build native kernels for specified compute capabilities
     cc_list = full_cc_list if cc_list_env is None else [int(x) for x in cc_list_env.split(',')]
-    for cc in cc_list:
-      default_flags += ['-gencode', 'arch=compute_{cc},code=sm_{cc}'.format(cc=cc)]
+    cc_list = sorted(cc_list)
+    for cc in cc_list[:-1]:
+        default_flags += ['-gencode', 'arch=compute_{cc},code=sm_{cc}'.format(cc=cc)]
     # Build PTX for maximum specified compute capability
-    default_flags += ['-gencode', 'arch=compute_{cc},code=compute_{cc}'.format(cc=max(cc_list))]
+    default_flags += ['-gencode', 'arch=compute_{cc},code=\\"sm_{cc},compute_{cc}\\"'.format(cc=cc_list[-1])]
 
     return default_flags

@@ -82,6 +82,9 @@ int64_t MXTensor::size() const {
 MXOpContext::MXOpContext(int device, NDArray* principal_output)
     : device_(device), outputs_{principal_output} {}
 
+MXOpContext::MXOpContext(int device, const std::vector<NDArray*>& outputs)
+    : device_(device), outputs_(outputs) {}
+
 void MXOpContext::AddOutput(NDArray* output) {
   outputs_.push_back(output);
 }
@@ -95,12 +98,14 @@ MXOpContext::AllocatePersistent(int64_t size,
 }
 
 Status MXOpContext::AllocateOutput(TensorShape shape,
-                                   std::shared_ptr<Tensor>* tensor) {
-  return MXOpContext::AllocateOutput(0, shape, tensor);
+                                   std::shared_ptr<Tensor>* tensor,
+                                   std::shared_ptr<ReadyEvent>* event) {
+  return MXOpContext::AllocateOutput(0, shape, tensor, event);
 }
 
 Status MXOpContext::AllocateOutput(int output_index, TensorShape shape,
-                                   std::shared_ptr<Tensor>* tensor) {
+                                   std::shared_ptr<Tensor>* tensor,
+                                   std::shared_ptr<ReadyEvent>* event) {
   int64_t* shape_array = new int64_t[shape.dims()];
   for (int idx = 0; idx < shape.dims(); idx++) {
     shape_array[idx] = shape.dim_size(idx);

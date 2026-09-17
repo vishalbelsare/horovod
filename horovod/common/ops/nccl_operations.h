@@ -23,8 +23,12 @@
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 7, 0)
 #define NCCL_P2P_SUPPORTED
 #endif
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 10, 0)
+#define NCCL_AVG_SUPPORTED
+#endif
 #elif HAVE_ROCM
 #include <rccl.h>
+#define NCCL_P2P_SUPPORTED
 #endif
 
 #include "../hashes.h"
@@ -131,6 +135,93 @@ public:
 protected:
   void WaitForData(std::vector<TensorTableEntry>& entries) override;
 
+  template <typename T>
+  Status PrepareOutputAndParams(TensorTableEntry& e,
+                                std::vector<T>& sdispls,
+                                std::vector<T>& rdispls,
+                                std::vector<T>& sendcounts,
+                                std::vector<T>& recvcounts) {
+    auto& process_set = global_state_->process_set_table.Get(e.process_set_id);
+    auto world_size = process_set.controller->GetSize();
+
+    const auto& splits = e.splits;
+    std::vector<int32_t> recvsplits;
+
+    process_set.controller->AlltoallGetRecvSplits(splits, recvsplits);
+
+    // Every tensor participating in Alltoall operation may have different
+    // first dimension size, but the rest of dimensions are same for all
+    // tensors.  Here we get shape of tensor sliced by first dimension.
+    TensorShape slice_shape;
+    for (int i = 1; i < e.tensor->shape().dims(); ++i) {
+      slice_shape.AddDim(e.tensor->shape().dim_size(i));
+    }
+    int64_t slice_num_elements = slice_shape.num_elements();
+
+    // Prepare send/recvcounts and displacements for Alltoallv
+    sdispls.resize(world_size);
+    rdispls.resize(world_size);
+    sendcounts.resize(world_size);
+    recvcounts.resize(world_size);
+
+    size_t output_first_dim = 0;
+    for (int i = 0; i < world_size; ++i) {
+      sendcounts[i] = splits[i] * slice_num_elements;
+      recvcounts[i] = recvsplits[i] * slice_num_elements;
+      output_first_dim += recvsplits[i];
+    }
+
+    for (int i = 1; i < world_size; ++i) {
+      sdispls[i] = sdispls[i-1] + sendcounts[i-1];
+      rdispls[i] = rdispls[i-1] + recvcounts[i-1];
+    }
+
+    // Allocate output
+    TensorShape output_shape;
+    output_shape.AddDim(output_first_dim);
+    output_shape.AppendShape(slice_shape);
+
+    std::shared_ptr<ReadyEvent> event;
+    Status status = e.context->AllocateOutput(output_shape, &e.output, &event);
+    if (!status.ok()) {
+      LOG(WARNING)
+          << "NCCLAlltoall::PrepareOutputAndParams failed to allocate output: "
+          << status.reason();
+      return status;
+    }
+
+    // Add event dependency for output allocation to stream
+    if (event) {
+      HVD_GPU_CHECK(gpuStreamWaitEvent(*gpu_op_context_.stream, event->event(), 0));
+    }
+
+    // Allocate and fill received_splits output
+    TensorShape received_splits_shape;
+    received_splits_shape.AddDim(recvsplits.size());
+
+    std::shared_ptr<ReadyEvent> revent;
+    Status rstatus = e.context->AllocateOutput(1, received_splits_shape,
+                                               &e.received_splits,
+                                               &revent);
+    if (!rstatus.ok()) {
+      LOG(WARNING) << "NCCLAlltoall::PrepareOutputAndParams failed to allocate "
+                      "received_splits: "
+                   << status.reason();
+      return rstatus;
+    }
+
+    // Add event dependency for received_splits allocation to stream
+    if (revent) {
+      HVD_GPU_CHECK(gpuStreamWaitEvent(*gpu_op_context_.stream, revent->event(), 0));
+    }
+
+    auto* target_pointer = reinterpret_cast<int32_t*>(
+        const_cast<void*>(e.received_splits->data()));
+    std::copy(recvsplits.cbegin(), recvsplits.cend(), target_pointer);
+
+    return Status::OK();
+  }
+
   NCCLContext* nccl_context_;
   NCCLOpContext nccl_op_context_;
   HorovodGlobalState* global_state_;
@@ -159,11 +250,67 @@ private:
 };
 #endif
 
+class NCCLTorusAllreduce : public GPUAllreduce {
+public:
+  NCCLTorusAllreduce(NCCLContext* local_nccl_context, NCCLContext* cross_nccl_context,
+                     GPUContext* gpu_context, HorovodGlobalState* global_state)
+      : GPUAllreduce(gpu_context, global_state),
+        local_nccl_context_(local_nccl_context),
+        cross_nccl_context_(cross_nccl_context),
+        local_nccl_op_context_(local_nccl_context, global_state, Communicator::LOCAL),
+        cross_nccl_op_context_(cross_nccl_context, global_state, Communicator::CROSS),
+        global_state_(global_state){};
+
+  Status Execute(std::vector<TensorTableEntry>& entries,
+                 const Response& response) override;
+
+  bool Enabled(const ParameterManager& param_manager,
+               const std::vector<TensorTableEntry>& entries,
+               const Response& response) const override;
+
+protected:
+  void WaitForData(std::vector<TensorTableEntry>& entries) override;
+
+  NCCLContext* local_nccl_context_;
+  NCCLContext* cross_nccl_context_;
+  NCCLOpContext local_nccl_op_context_;
+  NCCLOpContext cross_nccl_op_context_;
+  HorovodGlobalState* global_state_;
+};
+
 class NCCLAllgather : public GPUAllgather {
 public:
   NCCLAllgather(NCCLContext* nccl_context, GPUContext* gpu_context,
                 HorovodGlobalState* global_state)
       : GPUAllgather(gpu_context, global_state), nccl_context_(nccl_context),
+        nccl_op_context_(nccl_context, global_state, Communicator::GLOBAL),
+        global_state_(global_state) {}
+
+  Status Execute(std::vector<TensorTableEntry>& entries,
+                 const Response& response) override;
+
+  bool Enabled(const ParameterManager& param_manager,
+               const std::vector<TensorTableEntry>& entries,
+               const Response& response) const override;
+
+protected:
+  Status AllocateOutput(std::vector<TensorTableEntry>& entries,
+                        const Response& response,
+                        int64_t**& entry_component_sizes) override;
+
+  void WaitForData(std::vector<TensorTableEntry>& entries) override;
+
+  NCCLContext* nccl_context_;
+  NCCLOpContext nccl_op_context_;
+  HorovodGlobalState* global_state_;
+};
+
+class NCCLReducescatter : public GPUReducescatter {
+public:
+  NCCLReducescatter(NCCLContext* nccl_context, GPUContext* gpu_context,
+                    HorovodGlobalState* global_state)
+      : GPUReducescatter(gpu_context, global_state),
+        nccl_context_(nccl_context),
         nccl_op_context_(nccl_context, global_state, Communicator::GLOBAL),
         global_state_(global_state) {}
 

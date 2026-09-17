@@ -23,7 +23,7 @@ import mock
 from unittest.mock import Mock
 import pytest
 import numpy as np
-from distutils.version import LooseVersion
+from packaging import version
 
 import torch
 import torch.nn as nn
@@ -32,13 +32,13 @@ from torch.nn import functional as F
 from pyspark.ml.linalg import VectorUDT
 from pyspark.sql.types import FloatType, IntegerType
 
-# Spark PyTorch Lightning tests conflict with Tensorflow 2.5.x: https://github.com/horovod/horovod/pull/3263
+# Spark PyTorch Lightning tests conflict with Tensorflow 2.5.x and 2.6.x: https://github.com/horovod/horovod/pull/3263
 skip_lightning_tests = False
 try:
     # tensorflow has to be imported BEFORE pytorch_lightning, otherwise we see the segfault right away
     import tensorflow as tf
-    from distutils.version import LooseVersion
-    if LooseVersion('2.5.0') <= LooseVersion(tf.__version__) < LooseVersion('2.6.0'):
+    from packaging import version
+    if version.parse('2.5.0') <= version.parse(tf.__version__) < version.parse('2.7.0'):
         skip_lightning_tests = True
 except ImportError:
     pass
@@ -66,6 +66,9 @@ from spark_common import CallbackBackend, create_noisy_xor_data, create_noisy_xo
 class XOR(pl.LightningModule):
     def __init__(self, input_dim=2, output_dim=1):
         super(XOR, self).__init__()
+        # The Lightning checkpoint also saves the arguments passed into the LightningModule init
+        # under the "hyper_parameters" key in the checkpoint.
+        self.save_hyperparameters()
         self.lin1 = nn.Linear(input_dim, 8)
         self.lin2 = nn.Linear(8, output_dim)
 
@@ -92,9 +95,10 @@ class XOR(pl.LightningModule):
         y_hat = self(x)
         loss = F.binary_cross_entropy(y_hat, y.float())
         self.log('val_loss', loss)
+        return loss
 
     def validation_epoch_end(self, outputs):
-        avg_loss = torch.stack([x['val_loss'] for x in outputs]).mean() if len(outputs) > 0 else float('inf')
+        avg_loss = torch.stack(outputs).mean()
         self.log('avg_val_loss', avg_loss)
 
 
@@ -121,7 +125,7 @@ def create_legacy_xor_model(input_dim=2, output_dim=1):
     return LegacyXOR(input_dim, output_dim)
 
 
-@pytest.mark.skipif(LooseVersion(pl.__version__) < LooseVersion(MIN_PL_VERSION), reason='Pytorch lightning version is not supported.')
+@pytest.mark.skipif(version.parse(pl.__version__) < version.parse(MIN_PL_VERSION), reason='Pytorch lightning version is not supported.')
 class SparkLightningTests(unittest.TestCase):
 
     def __init__(self, *args, **kwargs):
@@ -150,7 +154,14 @@ class SparkLightningTests(unittest.TestCase):
                     validation=0.2,
                     batch_size=4,
                     epochs=2,
-                    verbose=2)
+                    random_seed=1,
+                    verbose=2,
+                    mp_start_method='spawn',
+                    trainer_args={"num_sanity_val_steps": 0})
+
+                assert 'spawn' == torch_estimator.getMpStartMethod()
+                torch_estimator.setMpStartMethod('forkserver')
+                assert 'forkserver' == torch_estimator.getMpStartMethod()
 
                 torch_model = torch_estimator.fit(df)
 
@@ -178,7 +189,8 @@ class SparkLightningTests(unittest.TestCase):
                     epochs=2,
                     verbose=2,
                     terminate_on_nan=True,
-                    profiler="pytorch")
+                    profiler="pytorch",
+                    trainer_args={"num_sanity_val_steps": 0})
                 assert torch_estimator.getTerminateOnNan() == True
 
     def test_legacy_fit_model(self):
@@ -215,11 +227,8 @@ class SparkLightningTests(unittest.TestCase):
                 assert len(pred) == 1
                 assert pred.dtype == torch.float32
 
-    # TODO: Add this test back after checkpoint call back is supported
     def test_restore_from_checkpoint(self):
-        self.skipTest('There is a deadlock bug for checkpoint call back. ' +
-                      'Will add this test back when it is solved.')
-
+        
         model = create_xor_model()
 
         with spark_session('test_restore_from_checkpoint') as spark:
@@ -240,7 +249,8 @@ class SparkLightningTests(unittest.TestCase):
                     batch_size=4,
                     epochs=2,
                     verbose=2,
-                    run_id=run_id)
+                    run_id=run_id,
+                    trainer_args={"num_sanity_val_steps": 0})
 
                 torch_estimator._read_checkpoint = Mock(side_effect=torch_estimator._read_checkpoint)
 
@@ -253,10 +263,7 @@ class SparkLightningTests(unittest.TestCase):
                 torch_estimator.fit(df)
                 torch_estimator._read_checkpoint.assert_called()
 
-    # TODO: Add this test back after checkpoint call back is supported
     def test_legacy_restore_from_checkpoint(self):
-        self.skipTest('There is a deadlock bug for checkpoint call back. ' +
-                      'Will add this test back when it is solved.')
 
         model = create_legacy_xor_model()
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
@@ -324,46 +331,6 @@ class SparkLightningTests(unittest.TestCase):
             for field in out_df.schema.fields:
                 assert type(field.dataType) == expected_types[field.name]
 
-    @mock.patch('horovod.torch.allgather')
-    @mock.patch('horovod.torch.local_size')
-    def test_calculate_shuffle_buffer_size_small_row_size(self, mock_local_size, mock_allgather):
-        import horovod.torch as hvd
-        hvd.init()
-
-        hvd_size = 4
-        local_size = 2
-        mock_local_size.return_value = local_size
-        mock_allgather.return_value = torch.tensor([local_size for _ in range(hvd_size)])
-
-        avg_row_size = 100
-        train_row_count_per_worker = 100
-
-        calculate_shuffle_buffer_size = remote._calculate_shuffle_buffer_size_fn(
-            train_row_count_per_worker, avg_row_size, None)
-        shuffle_size = calculate_shuffle_buffer_size()
-        assert shuffle_size == train_row_count_per_worker
-
-    @mock.patch('horovod.torch.allgather')
-    @mock.patch('horovod.torch.local_size')
-    def test_calculate_shuffle_buffer_size(self, mock_local_size, mock_allgather):
-        import horovod.torch as hvd
-        hvd.init()
-
-        # case with 2 workers, one with 5 ranks and second with 3 ranks
-        mock_allgather.return_value = torch.tensor([5, 5, 5, 5, 5, 3, 3, 3])
-        mock_local_size.return_value = 2
-
-        avg_row_size = 100000
-        train_row_count_per_worker = 1000000
-
-        calculate_shuffle_buffer_size = remote._calculate_shuffle_buffer_size_fn(
-            train_row_count_per_worker, avg_row_size, None)
-        shuffle_size = calculate_shuffle_buffer_size()
-
-        actual = int(shuffle_size)
-        expected = int(constants.TOTAL_BUFFER_MEMORY_CAP_GIB * constants.BYTES_PER_GIB / avg_row_size / 5)
-        assert actual == expected
-
     def test_prepare_data(self):
         with spark_session('test_prepare_data') as spark:
             df = create_xor_data(spark)
@@ -429,7 +396,8 @@ class SparkLightningTests(unittest.TestCase):
                                     epochs=3,
                                     verbose=2,
                                     inmemory_cache_all=inmemory_cache_all,
-                                    reader_pool_type=reader_pool_type)
+                                    reader_pool_type=reader_pool_type,
+                                    trainer_args={"num_sanity_val_steps": 0})
 
                                 transformer = est.fit_on_parquet()
                                 predictions = transformer.transform(df)
@@ -494,7 +462,8 @@ class SparkLightningTests(unittest.TestCase):
                     epochs=2,
                     verbose=2,
                     inmemory_cache_all=inmemory_cache_all,
-                    reader_pool_type=reader_pool_type)
+                    reader_pool_type=reader_pool_type,
+                    trainer_args={"num_sanity_val_steps": 0})
 
                 # set validation to any random strings would work.
                 est.setValidation("True")
@@ -577,7 +546,7 @@ class SparkLightningTests(unittest.TestCase):
 
         with spark_session('test_happy_run_elastic'):
             res = horovod.spark.run_elastic(fn, args=(2, 5, 4),
-                                            num_proc=2, min_np=2, max_np=2,
+                                            num_proc=2, min_num_proc=2, max_num_proc=2,
                                             start_timeout=10, verbose=2)
             self.assertListEqual([([0, 3, 0, 1, 1, 3, 0, 1], 0),
                                   ([0, 3, 0, 1, 1, 3, 0, 1], 1)], res)
@@ -602,7 +571,7 @@ class SparkLightningTests(unittest.TestCase):
                     pass
                 res = horovod.spark.run_elastic(fn, args=(2, 5, 5, dir),
                                                 env={'HOROVOD_LOG_LEVEL': 'DEBUG'},
-                                                num_proc=2, min_np=2, max_np=2,
+                                                num_proc=2, min_num_proc=2, max_num_proc=2,
                                                 start_timeout=5, verbose=2)
                 self.assertListEqual([([0, 4, 0, 4, 1, 4, 0, 4], 0),
                                       ([0, 4, 0, 4, 1, 4, 0, 4], 1)], res)
@@ -626,7 +595,7 @@ class SparkLightningTests(unittest.TestCase):
                     pass
                 res = horovod.spark.run_elastic(fn, args=(2, 5, 5, dir),
                                                 env={'HOROVOD_LOG_LEVEL': 'DEBUG'},
-                                                num_proc=2, min_np=2, max_np=2,
+                                                num_proc=2, min_num_proc=2, max_num_proc=2,
                                                 start_timeout=5, verbose=2)
                 self.assertListEqual([([0, 4, 0, 4, 1, 4, 0, 4], 0),
                                       ([0, 4, 0, 4, 1, 4, 0, 4], 1)], res)
@@ -687,7 +656,8 @@ class SparkLightningTests(unittest.TestCase):
                             batch_size=4,
                             epochs=epochs,
                             verbose=2,
-                            callbacks=callbacks)
+                            callbacks=callbacks,
+                            trainer_args={"num_sanity_val_steps": 0})
 
                         torch_model = torch_estimator.fit(df)
 
@@ -780,7 +750,8 @@ class SparkLightningTests(unittest.TestCase):
                         batch_size=4,
                         epochs=2,
                         verbose=2,
-                        callbacks=callbacks)
+                        callbacks=callbacks,
+                        trainer_args={"num_sanity_val_steps": 0})
 
                     torch_model = torch_estimator.fit(df)
 
@@ -797,6 +768,9 @@ class SparkLightningTests(unittest.TestCase):
         if skip_lightning_tests:
             self.skipTest('Spark PyTorch Lightning tests conflict with Tensorflow 2.5.x: '
                           'https://github.com/horovod/horovod/pull/3263')
+
+        if version.parse(torch.__version__) >= version.parse('1.13'):
+            self.skipTest('Torch 1.13+ fails EarlyStopping CB usage with Horovod.')
 
         from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 
@@ -823,7 +797,8 @@ class SparkLightningTests(unittest.TestCase):
                     batch_size=4,
                     epochs=2,
                     verbose=2,
-                    callbacks=callbacks)
+                    callbacks=callbacks,
+                    trainer_args={"num_sanity_val_steps": 0})
 
                 torch_model = torch_estimator.fit(df)
 
@@ -857,7 +832,8 @@ class SparkLightningTests(unittest.TestCase):
                     batch_size=4,
                     epochs=2,
                     verbose=2,
-                    inmemory_cache_all=True)
+                    inmemory_cache_all=True,
+                    trainer_args={"num_sanity_val_steps": 0})
 
                 torch_model = torch_estimator.fit(df)
 
@@ -879,7 +855,7 @@ class SparkLightningTests(unittest.TestCase):
         class CustomDataModule(pl.LightningDataModule):
             """Custom DataModule for Lightning Estimator, using PytorchAsyncDataLoader"""
             def __init__(self, train_dir: str, val_dir: str, has_val: bool=True,
-                         train_batch_size: int=32, val_batch_size: int=32, shuffle_size: int=100,
+                         train_batch_size: int=32, val_batch_size: int=32, shuffle: bool=True,
                          num_reader_epochs=None, cur_shard: int=0, shard_count: int=1, schema_fields=None,
                          storage_options=None, steps_per_epoch_train: int=1, steps_per_epoch_val: int=1, verbose=True, **kwargs):
                 super().__init__()
@@ -888,7 +864,7 @@ class SparkLightningTests(unittest.TestCase):
                 self.has_val = has_val
                 self.train_batch_size = train_batch_size
                 self.val_batch_size = val_batch_size
-                self.shuffle_size = shuffle_size
+                self.shuffle = shuffle
                 self.num_reader_epochs = num_reader_epochs
                 self.cur_shard = cur_shard
                 self.shard_count = shard_count
@@ -904,6 +880,8 @@ class SparkLightningTests(unittest.TestCase):
                 if stage == 'fit' or stage is None:
                     self.train_reader = make_batch_reader(self.train_dir, num_epochs=self.num_reader_epochs,
                                                           cur_shard=self.cur_shard, shard_count=self.shard_count,
+                                                          shuffle_rows=self.shuffle,
+                                                          shuffle_row_groups=self.shuffle,
                                                           hdfs_driver='libhdfs',
                                                           schema_fields=self.schema_fields,
                                                           storage_options=self.storage_options)
@@ -929,7 +907,7 @@ class SparkLightningTests(unittest.TestCase):
                     print("Setup train dataloader")
                 kwargs = dict(reader=self.train_reader, batch_size=self.train_batch_size,
                               name="train dataloader",
-                              shuffling_queue_capacity = self.shuffle_size,
+                              shuffling_queue_capacity=0,
                               limit_step_per_epoch=self.steps_per_epoch_train,
                               verbose=self.verbose)
                 return PytorchAsyncDataLoader(**kwargs)
@@ -962,7 +940,8 @@ class SparkLightningTests(unittest.TestCase):
                     batch_size=4,
                     epochs=2,
                     data_module=CustomDataModule,
-                    verbose=2)
+                    verbose=2,
+                    trainer_args={"num_sanity_val_steps": 0})
 
                 torch_model = torch_estimator.fit(df)
 

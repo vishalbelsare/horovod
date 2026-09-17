@@ -61,6 +61,47 @@ void HorovodOp::WaitForData(std::vector<TensorTableEntry>& entries) {
   }
 }
 
+void HorovodOp::ScaleBuffer(double scale_factor,
+                            const std::vector<TensorTableEntry>& entries,
+                            const void* fused_input_data, void* buffer_data,
+                            int64_t num_elements) {
+  DataType dtype = entries[0].tensor->dtype();
+  switch (dtype) {
+  case HOROVOD_UINT8:
+    ScaleBufferCPUImpl((const uint8_t*)fused_input_data, (uint8_t*)buffer_data,
+                       num_elements, scale_factor);
+    break;
+  case HOROVOD_INT8:
+    ScaleBufferCPUImpl((const int8_t*)fused_input_data, (int8_t*)buffer_data,
+                       num_elements, scale_factor);
+    break;
+  case HOROVOD_INT32:
+    ScaleBufferCPUImpl((const int32_t*)fused_input_data, (int32_t*)buffer_data,
+                       num_elements, scale_factor);
+    break;
+  case HOROVOD_INT64:
+    ScaleBufferCPUImpl((const int64_t*)fused_input_data, (int64_t*)buffer_data,
+                       num_elements, scale_factor);
+    break;
+  case HOROVOD_FLOAT16:
+    ScaleBufferCPUImpl((const unsigned short*)fused_input_data,
+                       (unsigned short*)buffer_data, num_elements,
+                       (float)scale_factor);
+    break;
+  case HOROVOD_FLOAT32:
+    ScaleBufferCPUImpl((const float*)fused_input_data, (float*)buffer_data,
+                       num_elements, (float)scale_factor);
+    break;
+  case HOROVOD_FLOAT64:
+    ScaleBufferCPUImpl((const double*)fused_input_data, (double*)buffer_data,
+                       num_elements, scale_factor);
+    break;
+  default:
+    throw std::logic_error("Type " + DataType_Name(dtype) +
+                           " not supported by ScaleBufferCPUImpl.");
+  }
+}
+
 // Allreduce
 AllreduceOp::AllreduceOp(HorovodGlobalState* global_state)
     : HorovodOp(global_state) {}
@@ -111,48 +152,13 @@ void AllreduceOp::MemcpyEntryOutFusionBuffer(
               (size_t)e.output->size());
 }
 
-void AllreduceOp::ScaleBuffer(
-    double scale_factor, const std::vector<TensorTableEntry>& entries,
-    const void* fused_input_data, void* buffer_data,
-    int64_t num_elements) {
-
-  DataType dtype = entries[0].tensor->dtype();
-  switch (dtype) {
-    case HOROVOD_UINT8:
-      ScaleBufferCPUImpl((const uint8_t*) fused_input_data, (uint8_t*) buffer_data, num_elements, scale_factor);
-      break;
-    case HOROVOD_INT8:
-      ScaleBufferCPUImpl((const int8_t*) fused_input_data, (int8_t*) buffer_data, num_elements, scale_factor);
-      break;
-    case HOROVOD_INT32:
-      ScaleBufferCPUImpl((const int32_t*) fused_input_data, (int32_t*) buffer_data, num_elements, scale_factor);
-      break;
-    case HOROVOD_INT64:
-      ScaleBufferCPUImpl((const int64_t*) fused_input_data, (int64_t*) buffer_data, num_elements, scale_factor);
-      break;
-    case HOROVOD_FLOAT16:
-      ScaleBufferCPUImpl((const unsigned short*) fused_input_data, (unsigned short*) buffer_data, num_elements, (float) scale_factor);
-      break;
-    case HOROVOD_FLOAT32:
-      ScaleBufferCPUImpl((const float*) fused_input_data, (float*) buffer_data, num_elements, (float) scale_factor);
-      break;
-    case HOROVOD_FLOAT64:
-      ScaleBufferCPUImpl((const double*) fused_input_data, (double*) buffer_data, num_elements, scale_factor);
-      break;
-    default:
-      throw std::logic_error("Type " + DataType_Name(dtype) +
-                             " not supported by ScaleBufferCPUImpl.");
-  }
-}
-
 // Allgather
 AllgatherOp::AllgatherOp(HorovodGlobalState* global_state)
     : HorovodOp(global_state) {}
 
 Status AllgatherOp::AllocateOutput(std::vector<TensorTableEntry>& entries,
                                    const Response& response,
-                                   int64_t**& entry_component_sizes,
-                                   int*& recvcounts) {
+                                   int64_t**& entry_component_sizes) {
   for (size_t ec = 0; ec < entries.size(); ++ec) {
     auto& e = entries[ec];
     auto& process_set = global_state_->process_set_table.Get(e.process_set_id);
@@ -173,13 +179,9 @@ Status AllgatherOp::AllocateOutput(std::vector<TensorTableEntry>& entries,
       auto component_size = tensor_sizes[ec * global_size + rc];
       total_entry_dimension_size += component_size;
 
-      if (recvcounts) {
-        recvcounts[rc] += component_size * single_slice_shape.num_elements();
-      }
-
       if (entry_component_sizes) {
         entry_component_sizes[ec][rc] =
-                          component_size * single_slice_shape.num_elements();
+            component_size * single_slice_shape.num_elements();
       }
     }
 
@@ -189,13 +191,30 @@ Status AllgatherOp::AllocateOutput(std::vector<TensorTableEntry>& entries,
     output_shape.AddDim((int64_t)total_entry_dimension_size);
     output_shape.AppendShape(single_slice_shape);
 
-    Status status = e.context->AllocateOutput(output_shape, &e.output);
+    Status status =
+        e.context->AllocateOutput(e.output_index, output_shape, &e.output);
     if (!status.ok()) {
+      LOG(WARNING) << "AllgatherOp::AllocateOutput failed: " << status.reason();
       return status;
     }
   }
 
   return Status::OK();
+}
+
+void AllgatherOp::SetRecvcounts(const int64_t* const* entry_component_sizes,
+                                size_t num_entries, int global_size,
+                                int*& recvcounts, int rank_padding_elements) {
+  assert(num_entries > 0);
+  for (int rc = 0; rc < global_size; ++rc) {
+    recvcounts[rc] = (int)entry_component_sizes[0][rc];
+    for (size_t ec = 1; ec < num_entries; ++ec) {
+      recvcounts[rc] += (int)entry_component_sizes[ec][rc];
+    }
+    recvcounts[rc] =
+        rank_padding_elements *
+        ((recvcounts[rc] + rank_padding_elements - 1) / rank_padding_elements);
+  }
 }
 
 void AllgatherOp::SetDisplacements(const int* recvcounts, int*& displcmnts,
@@ -210,16 +229,11 @@ void AllgatherOp::SetDisplacements(const int* recvcounts, int*& displcmnts,
 }
 
 void AllgatherOp::SetEntryComponentOffsets(
-    const std::vector<TensorTableEntry>& entries,
     const int64_t* const* entry_component_sizes, const int* recvcounts,
-    int64_t**& entry_component_offsets) {
-  assert(!entries.empty());
-  auto& process_set =
-      global_state_->process_set_table.Get(entries[0].process_set_id);
+    size_t num_entries, int global_size, int64_t**& entry_component_offsets) {
   unsigned int rank_displacement = 0;
-  int global_size = process_set.controller->GetSize();
   for (int rc = 0; rc < global_size; ++rc) {
-    for (size_t ec = 0; ec < entries.size(); ++ec) {
+    for (size_t ec = 0; ec < num_entries; ++ec) {
       if (ec == 0) {
         entry_component_offsets[ec][rc] = rank_displacement;
       } else {
@@ -243,7 +257,7 @@ void AllgatherOp::MemcpyInFusionBuffer(
 
   auto& process_set =
       global_state_->process_set_table.Get(first_entry.process_set_id);
-  int64_t offset = displcmnts[process_set.controller->GetRank()] * element_size;
+  int64_t offset = (int64_t)displcmnts[process_set.controller->GetRank()] * (int64_t)element_size;
   for (auto& e : entries) {
     void* buffer_data_at_offset = (uint8_t*)buffer_data + offset;
     MemcpyEntryInFusionBuffer(entries, e, buffer_data_at_offset);
@@ -292,6 +306,111 @@ BroadcastOp::BroadcastOp(HorovodGlobalState* global_state)
 
 AlltoallOp::AlltoallOp(HorovodGlobalState* global_state)
     : HorovodOp(global_state) {}
+
+// Reducescatter
+ReducescatterOp::ReducescatterOp(HorovodGlobalState* global_state)
+    : HorovodOp(global_state) {}
+
+TensorShape ReducescatterOp::ComputeOutputShapeForRank(
+    const TensorShape& tensor_shape, int rank, int global_size) {
+  // If tensor_shape.dim_size(0) % global_size != 0, the first ranks 0, ..., tensor_shape.dim_size(0) % global_size - 1
+  // may receive a slightly larger tensor.
+  assert(tensor_shape.dims() > 0);
+  int64_t min_size = tensor_shape.dim_size(0) / global_size;
+  int64_t max_size = tensor_shape.dim_size(0) / global_size + 1;
+  int64_t component_size = rank < tensor_shape.dim_size(0) % global_size ? max_size : min_size;
+
+  TensorShape output_shape;
+  output_shape.AddDim(component_size);
+  for (int i = 1; i < tensor_shape.dims(); ++i) {
+    output_shape.AddDim(tensor_shape.dim_size(i));
+  }
+
+  return output_shape;
+}
+
+std::vector<std::vector<TensorShape>> ReducescatterOp::ComputeOutputShapes(
+    const std::vector<TensorTableEntry>& entries, int global_size) const {
+  std::vector<std::vector<TensorShape>> output_shapes(global_size);
+  for (int rank = 0; rank < global_size; ++rank) {
+    output_shapes[rank].reserve(entries.size());
+    for (const auto& e : entries) {
+      TensorShape shape =
+          ComputeOutputShapeForRank(e.tensor->shape(), rank, global_size);
+      output_shapes[rank].emplace_back(std::move(shape));
+    }
+  }
+
+  return output_shapes;
+}
+
+std::vector<int> ReducescatterOp::ComputeReceiveCounts(
+    const std::vector<std::vector<TensorShape>>& output_shapes) const {
+  std::vector<int> recvcounts(output_shapes.size(), 0);
+  for (size_t rank = 0; rank < output_shapes.size(); ++rank) {
+    const auto& rank_shapes = output_shapes[rank];
+    for (const TensorShape& shape : rank_shapes) {
+      recvcounts[rank] += static_cast<int>(shape.num_elements());
+    }
+  }
+
+  return recvcounts;
+}
+
+void ReducescatterOp::MemcpyInFusionBuffer(
+    const std::vector<TensorTableEntry>& entries,
+    const std::vector<std::vector<TensorShape>>& output_shapes,
+    std::size_t element_size, void*& buffer_data,
+    size_t& buffer_len) {
+  // Access the fusion buffer.
+  auto& first_entry = entries[0];
+  auto buffer = global_state_->fusion_buffer.GetBuffer(
+      first_entry.device, first_entry.context->framework(),
+      global_state_->current_nccl_stream);
+  buffer_data = const_cast<void*>(buffer->AccessData(first_entry.context));
+
+  size_t buffer_offset = 0;
+  std::vector<size_t> entry_offsets(entries.size(), 0);
+
+  for (const auto& rank_shapes : output_shapes) {
+    for (size_t ec = 0; ec < entries.size(); ++ec) {
+      auto& e = entries[ec];
+      const auto& entry_shape = rank_shapes[ec];
+      auto entry_offset = entry_offsets[ec];
+      size_t entry_size = entry_shape.num_elements() * element_size;
+      void* buffer_data_at_offset = (uint8_t*)buffer_data + buffer_offset;
+      MemcpyEntryInFusionBuffer(e, entry_offset, entry_size,
+                                buffer_data_at_offset);
+      entry_offsets[ec] += entry_size;
+      buffer_offset += entry_size;
+    }
+  }
+  buffer_len = buffer_offset;
+}
+
+void ReducescatterOp::MemcpyOutFusionBuffer(
+    const void* buffer_data, std::vector<TensorTableEntry>& entries) {
+  int64_t offset = 0;
+  for (auto& e : entries) {
+    void* buffer_data_at_offset = (uint8_t*)buffer_data + offset;
+    MemcpyEntryOutFusionBuffer(buffer_data_at_offset, e);
+    offset += e.output->size();
+  }
+}
+
+void ReducescatterOp::MemcpyEntryInFusionBuffer(const TensorTableEntry& e,
+                                                size_t entry_offset,
+                                                size_t entry_size,
+                                                void* buffer_data_at_offset) {
+  void* tensor_data_at_offset = (uint8_t*)e.tensor->data() + entry_offset;
+  std::memcpy(buffer_data_at_offset, tensor_data_at_offset, entry_size);
+}
+
+void ReducescatterOp::MemcpyEntryOutFusionBuffer(
+    const void* buffer_data_at_offset, TensorTableEntry& e) {
+  std::memcpy((void*)e.output->data(), buffer_data_at_offset,
+              (size_t)e.output->size());
+}
 
 // Join
 JoinOp::JoinOp(HorovodGlobalState* global_state) : HorovodOp(global_state) {}

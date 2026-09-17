@@ -1,4 +1,5 @@
 # Copyright 2019 Uber Technologies, Inc. All Rights Reserved.
+# Modifications copyright (C) 2022, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,7 +20,7 @@ import os
 import sys
 import warnings
 
-from distutils.version import LooseVersion
+from packaging import version
 
 import mock
 import numpy as np
@@ -40,6 +41,12 @@ sys.path.append(os.path.join(os.path.dirname(__file__), os.pardir, 'utils'))
 
 from common import temppath
 from spark_common import CallbackBackend, create_mnist_data, create_xor_data, create_xor_data_with_val, local_store, spark_session
+
+try:
+    import nvtabular
+    HAS_NVTABULAR=True
+except ImportError:
+    HAS_NVTABULAR=False
 
 
 def create_xor_model():
@@ -64,7 +71,7 @@ def create_mnist_model():
 
 
 def get_mock_fit_fn():
-    def fit(model, train_data, val_data, steps_per_epoch, validation_steps, callbacks, verbose):
+    def fit(model, data_module, steps_per_epoch, validation_steps, callbacks, verbose):
         for callback in callbacks:
             callback.set_model(model)
             callback.on_epoch_end(0, logs={})
@@ -72,9 +79,11 @@ def get_mock_fit_fn():
     return fit
 
 
-#PR3099 [https://github.com/horovod/horovod/pull/3099] doesn't fix
-#Tensorflow>=2.6.0 tests
-@pytest.mark.skipif(LooseVersion(tf.__version__) >= LooseVersion('2.6.0'), reason='TensorFlow>=2.6.0 tests')
+def get_sgd_optimizer():
+    optimizer = tf.keras.optimizers.SGD(lr=0.1)
+    return optimizer
+
+
 class SparkKerasTests(tf.test.TestCase):
     def __init__(self, *args, **kwargs):
         super(SparkKerasTests, self).__init__(*args, **kwargs)
@@ -83,7 +92,7 @@ class SparkKerasTests(tf.test.TestCase):
 
     def test_fit_model(self):
         model = create_xor_model()
-        optimizer = tf.keras.optimizers.SGD(lr=0.1)
+        optimizer = get_sgd_optimizer()
         loss = 'binary_crossentropy'
 
         with spark_session('test_fit_model') as spark:
@@ -99,8 +108,17 @@ class SparkKerasTests(tf.test.TestCase):
                     feature_cols=['features'],
                     label_cols=['y'],
                     batch_size=1,
+                    random_seed=1,
                     epochs=3,
-                    verbose=2)
+                    verbose=2,
+                    use_gpu=False,
+                    mp_start_method='spawn')
+
+                assert not keras_estimator.getUseGpu()
+                assert 'spawn' == keras_estimator.getMpStartMethod()
+
+                keras_estimator.setMpStartMethod('forkserver')
+                assert 'forkserver' == keras_estimator.getMpStartMethod()
 
                 keras_model = keras_estimator.fit(df)
 
@@ -108,6 +126,86 @@ class SparkKerasTests(tf.test.TestCase):
                 pred = trained_model.predict([np.ones([1, 2], dtype=np.float32)])
                 assert len(pred) == 1
                 assert pred.dtype == np.float32
+
+    @pytest.mark.skipif(not HAS_NVTABULAR, reason='NVTabular unavailable')
+    def test_fit_model_nvtabular_vector(self):
+        from horovod.spark.keras.datamodule import NVTabularDataModule
+
+        model = create_xor_model()
+        optimizer = get_sgd_optimizer()
+        loss = 'binary_crossentropy'
+
+        with spark_session('test_fit_model_nvtabular_vector') as spark:
+            df = create_xor_data(spark)
+            df = df.withColumnRenamed('features', 'dense_input')
+
+            with local_store() as store:
+                keras_estimator = hvd.KerasEstimator(
+                    num_proc=1,
+                    data_module=NVTabularDataModule,
+                    store=store,
+                    model=model,
+                    optimizer=optimizer,
+                    loss=loss,
+                    feature_cols=['dense_input'],
+                    label_cols=['y'],
+                    categorical_cols=None,
+                    continuous_cols=['dense_input'],
+                    batch_size=1,
+                    random_seed=1,
+                    epochs=3,
+                    verbose=2,
+                    use_gpu=True)
+
+                keras_model = keras_estimator.fit(df)
+
+                trained_model = keras_model.getModel()
+                pred = trained_model.predict([np.ones([1, 2], dtype=np.float32)])
+                assert len(pred) == 1
+                assert pred.dtype == np.float32
+
+    @pytest.mark.skipif(not HAS_NVTABULAR, reason='NVTabular unavailable')
+    def test_fit_model_nvtabular_scalar(self):
+        from horovod.spark.keras.datamodule import NVTabularDataModule
+
+        np.random.seed(1234)
+        continuous = np.random.rand(1000, 2)
+        weights = np.array([3.142, 1.618])
+        labels = np.dot(continuous, weights)
+        train_examples = [(continuous[i][0].item(), continuous[i][1].item(), labels[i].item()) for i in range(1000)]
+
+        with spark_session('test_fit_model_nvtabular_scalar') as spark:
+            with local_store() as store:
+                df = spark.createDataFrame(train_examples, schema=['c1', 'c2', 'labels'])
+
+                c1 = tf.keras.layers.Input(shape=(1,), name='c1')
+                c2 = tf.keras.layers.Input(shape=(1,), name='c2')
+                merged = tf.keras.layers.Concatenate(axis=1)([c1, c2])
+                output = tf.keras.layers.Dense(1, activation='linear', input_shape=[2])(merged)
+                model = tf.keras.Model(inputs=[c1, c2], outputs=output)
+                model.summary()
+
+                optimizer = get_sgd_optimizer()
+                loss = tf.keras.losses.MeanSquaredError()
+
+                keras_estimator = hvd.KerasEstimator(
+                    num_proc=2,
+                    data_module=NVTabularDataModule,
+                    store=store,
+                    model=model,
+                    optimizer=optimizer,
+                    loss=loss,
+                    feature_cols=['c1', 'c2'],
+                    label_cols=['labels'],
+                    categorical_cols=None,
+                    continuous_cols=['c1', 'c2'],
+                    batch_size=16,
+                    random_seed=1,
+                    epochs=3,
+                    verbose=2,
+                    use_gpu=True)
+
+                keras_estimator.fit(df)
 
     def test_fit_model_multiclass(self):
         model = create_mnist_model()
@@ -145,6 +243,45 @@ class SparkKerasTests(tf.test.TestCase):
                     label_prob = row.label_prob.toArray().tolist()
                     assert label_prob[int(row.label_pred)] == max(label_prob)
 
+    def test_fit_model_with_tensorflow_dataset_prefetch_buffer_size(self):
+        model = create_xor_model()
+        optimizer = get_sgd_optimizer()
+        loss = 'binary_crossentropy'
+
+        with spark_session('test_fit_model_with_tensorflow_dataset_prefetch_buffer_size') as spark:
+            df = create_xor_data(spark)
+
+            with local_store() as store:
+                keras_estimator = hvd.KerasEstimator(
+                    num_proc=2,
+                    store=store,
+                    model=model,
+                    optimizer=optimizer,
+                    loss=loss,
+                    feature_cols=['features'],
+                    label_cols=['y'],
+                    batch_size=1,
+                    random_seed=1,
+                    epochs=3,
+                    verbose=2,
+                    use_gpu=False,
+                    mp_start_method='spawn',
+                    tensorflow_dataset_prefetch_buffer_size=1)
+
+                assert not keras_estimator.getUseGpu()
+                assert 'spawn' == keras_estimator.getMpStartMethod()
+
+                keras_estimator.setMpStartMethod('forkserver')
+                assert 'forkserver' == keras_estimator.getMpStartMethod()
+
+                keras_model = keras_estimator.fit(df)
+
+                trained_model = keras_model.getModel()
+                pred = trained_model.predict([np.ones([1, 2], dtype=np.float32)])
+                assert len(pred) == 1
+                assert pred.dtype == np.float32
+
+
     @mock.patch('horovod.spark.keras.remote._pin_gpu_fn')
     @mock.patch('horovod.spark.keras.util.TFKerasUtil.fit_fn')
     def test_restore_from_checkpoint(self, mock_fit_fn, mock_pin_gpu_fn):
@@ -152,7 +289,7 @@ class SparkKerasTests(tf.test.TestCase):
         mock_pin_gpu_fn.return_value = mock.Mock()
 
         model = create_xor_model()
-        optimizer = tf.keras.optimizers.SGD(lr=0.1)
+        optimizer = get_sgd_optimizer()
         loss = 'binary_crossentropy'
 
         with spark_session('test_restore_from_checkpoint') as spark:
@@ -215,7 +352,7 @@ class SparkKerasTests(tf.test.TestCase):
                                            label_columns=['y'],
                                            validation=validation):
                         model = create_xor_model()
-                        optimizer = tf.keras.optimizers.SGD(lr=0.1)
+                        optimizer = get_sgd_optimizer()
                         loss = 'binary_crossentropy'
 
                         for inmemory_cache_all in [False, True]:
@@ -245,7 +382,7 @@ class SparkKerasTests(tf.test.TestCase):
         from horovod.tensorflow.keras.callbacks import BestModelCheckpoint
 
         def _get_mock_fit_fn(checkpoint_callback_provided):
-            def fit(model, train_data, val_data, steps_per_epoch, validation_steps, callbacks,
+            def fit(model, data_module, steps_per_epoch, validation_steps, callbacks,
                     verbose):
                 returned_model_checkpoint_present = False
                 model_checkpoint_present = False
@@ -295,7 +432,7 @@ class SparkKerasTests(tf.test.TestCase):
                                        feature_columns=['features'],
                                        label_columns=['y']):
                     model = create_xor_model()
-                    optimizer = tf.keras.optimizers.SGD(lr=0.1)
+                    optimizer = get_sgd_optimizer()
                     loss = 'binary_crossentropy'
 
                     # Test when the checkpoint callback is not set, the correct one is created
@@ -339,7 +476,7 @@ class SparkKerasTests(tf.test.TestCase):
     @mock.patch('horovod.spark.keras.estimator.remote.RemoteTrainer')
     def test_model_serialization(self, mock_remote_trainer):
         model = create_xor_model()
-        optimizer = tf.keras.optimizers.SGD(lr=0.1)
+        optimizer = get_sgd_optimizer()
         loss = 'binary_crossentropy'
 
         def train(serialized_model, train_rows, val_rows, avg_row_size):
@@ -384,34 +521,6 @@ class SparkKerasTests(tf.test.TestCase):
 
         serialized_dummy_param = _serialize_param_value('dummy_param_name', None, None, None)
         assert serialized_dummy_param is None
-
-    def test_calculate_shuffle_buffer_size_small_row_size(self):
-        hvd_size = 4
-        local_size = 2
-        hvd_mock = mock.MagicMock()
-        hvd_mock.local_size.return_value = local_size
-        hvd_mock.allgather.return_value = [local_size for _ in range(hvd_size)]
-
-        avg_row_size = 100
-        train_row_count_per_worker = 100
-
-        calculate_shuffle_buffer_size = remote._calculate_shuffle_buffer_size_fn()
-        shuffle_size = calculate_shuffle_buffer_size(hvd_mock, avg_row_size, train_row_count_per_worker)
-        assert shuffle_size == train_row_count_per_worker
-
-    def test_calculate_shuffle_buffer_size(self):
-        # case with 2 workers, one with 5 ranks and second with 3 ranks
-        hvd_mock = mock.MagicMock()
-        hvd_mock.allgather.return_value = [5, 5, 5, 5, 5, 3, 3, 3]
-        hvd_mock.local_size.return_value = 2
-
-        avg_row_size = 100000
-        train_row_count_per_worker = 1000000
-
-        calculate_shuffle_buffer_size = remote._calculate_shuffle_buffer_size_fn()
-        shuffle_size = calculate_shuffle_buffer_size(hvd_mock, avg_row_size, train_row_count_per_worker)
-
-        assert int(shuffle_size) == int(constants.TOTAL_BUFFER_MEMORY_CAP_GIB * constants.BYTES_PER_GIB / avg_row_size / 5)
 
     def test_custom_sparse_to_dense_fn(self):
         dense_shape = 10

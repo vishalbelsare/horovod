@@ -20,15 +20,11 @@ _MPI_LIB_AVAILABLE = True
 try:
     check_extension('horovod.torch', 'HOROVOD_WITH_PYTORCH',
                     __file__, 'mpi_lib_v2')
-except:
-    try:
-        check_extension('horovod.torch', 'HOROVOD_WITH_PYTORCH',
-                    __file__, 'mpi_lib', '_mpi_lib')
-    except Exception as e:
-        # MPI libs are missing, but python applications are still available.
-        print(e)
-        print("Warning! MPI libs are missing, but python applications are still available.")
-        _MPI_LIB_AVAILABLE = False
+except Exception as e:
+    # MPI libs are missing, but python applications are still available.
+    print(e)
+    print("Warning! MPI libs are missing, but python applications are still available.")
+    _MPI_LIB_AVAILABLE = False
 
 # only import following function when mpi is available.
 if _MPI_LIB_AVAILABLE:
@@ -39,8 +35,11 @@ if _MPI_LIB_AVAILABLE:
     from horovod.torch.mpi_ops import grouped_allreduce, grouped_allreduce_async, grouped_allreduce_, grouped_allreduce_async_
     from horovod.torch.mpi_ops import sparse_allreduce_async
     from horovod.torch.mpi_ops import allgather, allgather_async
+    from horovod.torch.mpi_ops import grouped_allgather, grouped_allgather_async
     from horovod.torch.mpi_ops import broadcast, broadcast_async, broadcast_, broadcast_async_
     from horovod.torch.mpi_ops import alltoall, alltoall_async
+    from horovod.torch.mpi_ops import reducescatter, reducescatter_async
+    from horovod.torch.mpi_ops import grouped_reducescatter, grouped_reducescatter_async
     from horovod.torch.mpi_ops import join
     from horovod.torch.mpi_ops import barrier
     from horovod.torch.mpi_ops import poll, synchronize
@@ -51,7 +50,8 @@ if _MPI_LIB_AVAILABLE:
     from horovod.torch.mpi_ops import gloo_enabled, gloo_built
     from horovod.torch.mpi_ops import nccl_built, ddl_built, ccl_built, cuda_built, rocm_built
     from horovod.torch.mpi_ops import ProcessSet, global_process_set, add_process_set, remove_process_set
-    from horovod.torch.mpi_ops import Average, Sum, Adasum
+    from horovod.torch.mpi_ops import Average, Sum, Adasum, Min, Max, Product
+    from horovod.torch.mpi_ops import HorovodInternalError
     from horovod.torch.optimizer import DistributedOptimizer
     from horovod.torch.sync_batch_norm import SyncBatchNorm
 

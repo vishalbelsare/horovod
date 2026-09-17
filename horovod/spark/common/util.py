@@ -763,15 +763,16 @@ def to_list(var, length):
     return var
 
 
-def _get_assigned_gpu_or_default(default):
+def _get_assigned_gpu_or_local_rank(local_rank):
     from horovod.spark.task import get_available_devices
     available_devices = get_available_devices()
-    if available_devices:
+    if available_devices and os.getenv('HOROVOD_SPARK_USE_LOCAL_RANK_GPU_INDEX', '0') == '0':
         # if GPU-aware scheduling is available, pin to the assigned GPU index
+        # this is always the first GPU index in available_devices as only one GPU is expected to be assigned
         return int(available_devices[0])
     else:
-        # pin to default GPU index (local rank)
-        return default
+        # pin to local rank GPU index
+        return local_rank
 
 
 def is_databricks():
@@ -811,3 +812,13 @@ def get_spark_df_output_schema(input_df_schema, label_cols, output_cols, metadat
     output_schema = StructType(output_fields)
 
     return output_schema
+
+def _set_mp_start_method(method, verbose):
+    import multiprocessing as mp
+    supported_values = mp.get_all_start_methods()
+    if method not in supported_values:
+        raise ValueError(f"Multiprocessing start method {method} is not supported on this system. "
+                         f"Supported values are : {supported_values}")
+    mp.set_start_method(method)
+    if verbose:
+        print(f'Multiprocessing start method has been set to {mp.get_start_method()}')

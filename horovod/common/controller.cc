@@ -18,7 +18,6 @@
 #include "controller.h"
 
 #include <atomic>
-#include <map>
 #include <queue>
 #include <set>
 #include <unordered_set>
@@ -29,6 +28,8 @@
 
 #if HAVE_CUDA
 #include "ops/cuda/cuda_kernels.h"
+#elif HAVE_ROCM
+#include "ops/rocm/hip_kernels.h"
 #endif
 
 
@@ -273,12 +274,6 @@ ResponseList Controller::ComputeResponseList(bool this_process_requested_shutdow
 
         bool reduce = IncrementTensorCount(message, process_set.joined_size);
 
-        // For barrier request, if not ready to reduce, we add it back to tensor queue
-        // to process in the next cycle.
-        if(!reduce && message.request_type() == Request::BARRIER) {
-          tensor_queue_.PushMessageToQueue(message);
-        }
-
         stall_inspector_.RecordUncachedTensorStart(
             message.tensor_name(), message.request_rank(), size_);
         if (reduce) {
@@ -492,7 +487,7 @@ int64_t Controller::TensorFusionThresholdBytes() {
     // Ensuring that fusion buffer can hold a number of elements divisible by
     // FUSION_BUFFER_ATOMIC_UNIT for performance
     int double_size = GetTypeSize(HOROVOD_FLOAT64);
-    int64_t div = local_size_ * double_size * FUSION_BUFFER_ATOMIC_UNIT;
+    int64_t div = (int64_t)local_size_ * (int64_t)double_size * FUSION_BUFFER_ATOMIC_UNIT;
     return ((proposed_fusion_threshold + div - 1) / div) * div;
   }
   return proposed_fusion_threshold;
@@ -542,11 +537,12 @@ Response Controller::ConstructResponse(const std::string& name, int joined_size)
     }
   }
 
-  // If we are doing an allreduce or broadcast, check that all tensor shapes are
-  // identical.
+  // If we are doing an allreduce, broadcast, or reducescatter check that all
+  // tensor shapes are identical.
   if (message_type == Request::ALLREDUCE ||
       message_type == Request::ADASUM ||
-      message_type == Request::BROADCAST) {
+      message_type == Request::BROADCAST ||
+      message_type == Request::REDUCESCATTER) {
     TensorShape tensor_shape;
     for (auto dim : requests[0].tensor_shape()) {
       tensor_shape.AddDim(dim);
@@ -573,12 +569,12 @@ Response Controller::ConstructResponse(const std::string& name, int joined_size)
     }
   }
 
-  // If we are doing an allreduce, check that prescaling and postscaling factors
+  // If we are doing a reduction, check that prescaling and postscaling factors
   // are identical across ranks.
   double prescale_factor;
   double postscale_factor;
-  if (message_type == Request::ALLREDUCE ||
-      message_type == Request::ADASUM) {
+  if (message_type == Request::ALLREDUCE || message_type == Request::ADASUM ||
+      message_type == Request::REDUCESCATTER) {
     prescale_factor = requests[0].prescale_factor();
     postscale_factor = requests[0].postscale_factor();
 
@@ -594,10 +590,32 @@ Response Controller::ConstructResponse(const std::string& name, int joined_size)
         error = true;
         error_message_stream
             << "Mismatched prescale and/or postscale factors: "
-            << "One rank sent factors (" << prescale_factor
-            << ", " << postscale_factor << "), but another rank "
-            << "sent factors (" << request_prescale_factor
-            << ", " << request_postscale_factor << ").";
+            << "One rank sent factors (" << prescale_factor << ", "
+            << postscale_factor << "), but another rank "
+            << "sent factors (" << request_prescale_factor << ", "
+            << request_postscale_factor << ").";
+        break;
+      }
+    }
+  }
+
+  // If we are doing an allreduce, check that the reduction op is indentical
+  // across ranks.
+  ReduceOp reduce_op;
+  if (message_type == Request::ALLREDUCE) {
+    reduce_op = requests[0].reduce_op();
+    for (unsigned int i = 1; i < requests.size(); ++i) {
+      if (error) {
+        break;
+      }
+      ReduceOp request_reduce_op = requests[i].reduce_op();
+      if (reduce_op != request_reduce_op) {
+        error = true;
+        error_message_stream
+            << "Mismatched reduction operation: "
+            << "One rank sent reduction op " << reduce_op
+            << ", but another rank sent reduction op "
+            << request_reduce_op << ".";
         break;
       }
     }
@@ -675,6 +693,38 @@ Response Controller::ConstructResponse(const std::string& name, int joined_size)
       // Collect first dimension sizes for allgather to use for fusion and allgather op.
       if (message_type == Request::ALLGATHER) {
         tensor_sizes[requests[i].request_rank()] = request_shape.dim_size(0);
+      }
+    }
+  }
+
+  if (message_type == Request::REDUCESCATTER) {
+    if (joined_size > 0) {
+      error = true;
+      error_message_stream << "Reducescatter is not supported with Join at this time.";
+    }
+
+    TensorShape tensor_shape;
+    for (auto dim : requests[0].tensor_shape()) {
+      tensor_shape.AddDim(dim);
+    }
+    if (tensor_shape.dims() == 0) {
+      error = true;
+      error_message_stream << "Process-set rank zero tried to "
+                           << Request::RequestType_Name(message_type)
+                           << " a rank-zero tensor.";
+    } else {
+      tensor_sizes.push_back(tensor_shape.num_elements());
+    }
+    if (requests[0].prescale_factor() != 1.0) {
+      auto tensor_bytes = tensor_shape.num_elements() * GetTypeSize(data_type);
+      if (tensor_bytes > TensorFusionThresholdBytes()) {
+        error = true;
+        error_message_stream << "Reducescatter with prescale_factor == "
+                             << requests[0].prescale_factor()
+                             << " != 1.0: The fusion buffer is not large "
+                                "enough to hold the input tensor ("
+                             << tensor_bytes
+                             << " bytes); increase HOROVOD_FUSION_THRESHOLD.";
       }
     }
   }
@@ -758,10 +808,19 @@ Response Controller::ConstructResponse(const std::string& name, int joined_size)
     response.set_tensor_type(data_type);
     response.set_prescale_factor(prescale_factor);
     response.set_postscale_factor(postscale_factor);
+    response.set_reduce_op(reduce_op);
   } else if (message_type == Request::BROADCAST) {
     response.set_response_type(Response::BROADCAST);
   } else if (message_type == Request::ALLTOALL) {
     response.set_response_type(Response::ALLTOALL);
+  } else if (message_type == Request::REDUCESCATTER) {
+    response.set_response_type(Response::REDUCESCATTER);
+    for (auto dim : tensor_sizes) {
+      response.add_tensor_size(dim);
+    }
+    response.set_tensor_type(data_type);
+    response.set_prescale_factor(prescale_factor);
+    response.set_postscale_factor(postscale_factor);
   } else if (message_type == Request::ADASUM) {
     response.set_response_type(Response::ADASUM);
     for (auto dim : tensor_sizes) {
@@ -811,9 +870,43 @@ void Controller::CoordinateCacheAndState(CacheCoordinator& cache_coordinator) {
   }
 }
 
+namespace {
+int64_t SumPadded(const std::vector<int64_t>& vec, int padding) {
+  int64_t result = 0;
+  for (auto el : vec) {
+    result += padding * ((el + padding - 1) / padding);
+  }
+  return result;
+}
+
+int64_t SumPairwisePadded(const std::vector<int64_t>& vec1,
+                          const std::vector<int64_t>& vec2, int padding) {
+  int64_t result = 0;
+  assert(vec1.size() == vec2.size());
+  for (size_t i = 0; i < vec1.size(); ++i) {
+    result += padding * ((vec1[i] + vec2[i] + padding - 1) / padding);
+  }
+  return result;
+}
+
+void AddVectorToVector(std::vector<int64_t>& vec1,
+                       const std::vector<int64_t>& vec2) {
+  assert(vec1.size() == vec2.size());
+  for (size_t i = 0; i < vec1.size(); ++i) {
+    vec1[i] += vec2[i];
+  }
+}
+} // namespace
+
 void Controller::FuseResponses(std::deque<Response>& responses,
                                HorovodGlobalState& state,
                                ResponseList& response_list) {
+  // Avoid re-allocating these vectors inside loop
+  std::vector<int64_t> allgather_tensor_byte_sizes;
+  allgather_tensor_byte_sizes.reserve(GetSize());
+  std::vector<int64_t> allgather_new_tensor_byte_sizes;
+  allgather_new_tensor_byte_sizes.reserve(GetSize());
+
   while (!responses.empty()) {
 
     auto response = responses.front();
@@ -821,16 +914,20 @@ void Controller::FuseResponses(std::deque<Response>& responses,
     responses.pop_front();
     int64_t tensor_size = 0;
     if (response.response_type() == Response::ResponseType::ALLREDUCE ||
-        response.response_type() == Response::ResponseType::ADASUM) {
+        response.response_type() == Response::ResponseType::ADASUM ||
+        response.response_type() == Response::ResponseType::REDUCESCATTER) {
       // Attempt to add more responses to this fused response.
 
       tensor_size = response.tensor_sizes()[0] * GetTypeSize(response.tensor_type());
-#if HAVE_CUDA
-      if (state.batch_d2d_memcopies) {
+#if HAVE_CUDA || HAVE_ROCM
+      if (state.batch_d2d_memcopies &&
+          response.response_type() != Response::ResponseType::REDUCESCATTER) {
         // Add 16 byte pad for batched memcpy op
-        tensor_size = BATCHED_D2D_PADDING * ((tensor_size + BATCHED_D2D_PADDING - 1) / BATCHED_D2D_PADDING);
+        tensor_size =
+            BATCHED_D2D_PADDING *
+            ((tensor_size + BATCHED_D2D_PADDING - 1) / BATCHED_D2D_PADDING);
       }
-#endif
+#endif // HAVE_CUDA || HAVE_ROCM
       std::deque<Response> skipped_responses;
       int64_t skipped_size = 0;
       while (!responses.empty()) {
@@ -842,19 +939,23 @@ void Controller::FuseResponses(std::deque<Response>& responses,
                                       : new_response.tensor_sizes()[0] *
                                         GetTypeSize(new_response.tensor_type());
 
-#if HAVE_CUDA
-        if (state.batch_d2d_memcopies) {
+#if HAVE_CUDA || HAVE_ROCM
+        if (state.batch_d2d_memcopies &&
+            response.response_type() != Response::ResponseType::REDUCESCATTER) {
           // Add 16 byte pad for batched memcpy op
-          new_tensor_size = BATCHED_D2D_PADDING * ((new_tensor_size + BATCHED_D2D_PADDING - 1) / BATCHED_D2D_PADDING);
+          new_tensor_size = BATCHED_D2D_PADDING *
+                            ((new_tensor_size + BATCHED_D2D_PADDING - 1) /
+                             BATCHED_D2D_PADDING);
         }
-#endif
+#endif // HAVE_CUDA || HAVE_ROCM
 
         if (response.response_type() == new_response.response_type() &&
             response.devices() == new_response.devices() &&
             response.tensor_type() == new_response.tensor_type() &&
             tensor_size + new_tensor_size <= TensorFusionThresholdBytes() &&
             response.prescale_factor() == new_response.prescale_factor() &&
-            response.postscale_factor() == new_response.postscale_factor()) {
+            response.postscale_factor() == new_response.postscale_factor() &&
+            response.reduce_op() == new_response.reduce_op()) {
           // These tensors will fuse together well.
           tensor_size += new_tensor_size;
           response.add_tensor_name(std::move(new_response.tensor_names()[0]));
@@ -869,7 +970,21 @@ void Controller::FuseResponses(std::deque<Response>& responses,
           // sequence causing breakups in fusion. To counter this some look
           // ahead is allowed.
 
-          skipped_size += new_tensor_size;
+          if (new_response.response_type() ==
+              Response::ResponseType::ALLGATHER) {
+            // Allgather: Not counting padding for skipped_size estimate.
+            assert(new_response.tensor_names().size() == 1);
+            const auto& new_entry =
+                tensor_queue_.GetTensorEntry(new_response.tensor_names()[0]);
+            SetTensorByteSizesForAllgatheredTensors(
+                allgather_new_tensor_byte_sizes, new_response.tensor_sizes(),
+                new_entry);
+            skipped_size +=
+                std::accumulate(allgather_new_tensor_byte_sizes.begin(),
+                                allgather_new_tensor_byte_sizes.end(), 0LL);
+          } else {
+            skipped_size += new_tensor_size;
+          }
           if (tensor_size + skipped_size <= TensorFusionThresholdBytes()) {
             // Skip response and look ahead for more to fuse.
             skipped_responses.push_back(std::move(new_response));
@@ -890,30 +1005,42 @@ void Controller::FuseResponses(std::deque<Response>& responses,
       const auto& entry =
           tensor_queue_.GetTensorEntry(response.tensor_names()[0]);
 
-      // This is size of first dimension.
-      int64_t total_byte_size_of_output =
-          TotalByteSizeOfAllgatherOutput(response.tensor_sizes(), entry);
+      int rankwise_padding_bytes = 1;
+#if HAVE_CUDA || HAVE_ROCM
+      // 16 byte pad for efficient allgather
+      rankwise_padding_bytes = BATCHED_D2D_PADDING;
+#endif
+      // response.tensor_sizes(): Size of first dimension for each rank.
+      SetTensorByteSizesForAllgatheredTensors(allgather_tensor_byte_sizes,
+                                              response.tensor_sizes(), entry);
 
       std::deque<Response> skipped_responses;
       int64_t skipped_size = 0;
       while (!responses.empty()) {
 
         auto& new_response = responses.front();
+        if (new_response.response_type() == Response::ResponseType::BARRIER ||
+            new_response.response_type() == Response::ResponseType::JOIN) {
+          break;
+        }
         assert(new_response.tensor_names().size() == 1);
         const auto& new_entry =
             tensor_queue_.GetTensorEntry(new_response.tensor_names()[0]);
 
-        int64_t new_total_byte_size_of_output = TotalByteSizeOfAllgatherOutput(
-            new_response.tensor_sizes(), new_entry);
+        SetTensorByteSizesForAllgatheredTensors(allgather_new_tensor_byte_sizes,
+                                                new_response.tensor_sizes(),
+                                                new_entry);
 
         if (response.response_type() == new_response.response_type() &&
             response.devices() == new_response.devices() &&
             entry.tensor->dtype() == new_entry.tensor->dtype() &&
-            total_byte_size_of_output + new_total_byte_size_of_output <=
-                TensorFusionThresholdBytes()) {
+            SumPairwisePadded(
+                allgather_tensor_byte_sizes, allgather_new_tensor_byte_sizes,
+                rankwise_padding_bytes) <= TensorFusionThresholdBytes()) {
 
           // These tensors will fuse together well.
-          total_byte_size_of_output += new_total_byte_size_of_output;
+          AddVectorToVector(allgather_tensor_byte_sizes,
+                            allgather_new_tensor_byte_sizes);
           response.add_allgather_response(new_response);
           responses.pop_front();
 
@@ -926,7 +1053,20 @@ void Controller::FuseResponses(std::deque<Response>& responses,
           // sequence causing breakups in fusion. To counter this some look
           // ahead is allowed.
 
-          skipped_size += new_total_byte_size_of_output;
+          auto total_byte_size_of_output =
+              SumPadded(allgather_tensor_byte_sizes, rankwise_padding_bytes);
+          // Not counting padding for skipped_size estimate.
+          if (new_response.response_type() ==
+              Response::ResponseType::ALLGATHER) {
+            skipped_size +=
+                std::accumulate(allgather_new_tensor_byte_sizes.begin(),
+                                allgather_new_tensor_byte_sizes.end(), 0LL);
+          } else {
+            skipped_size += new_response.tensor_sizes().empty()
+                                ? 0
+                                : new_response.tensor_sizes()[0] *
+                                      GetTypeSize(new_response.tensor_type());
+          }
           if (total_byte_size_of_output + skipped_size <=
               TensorFusionThresholdBytes()) {
             // Skip response and look ahead for more to fuse.
@@ -950,26 +1090,22 @@ void Controller::FuseResponses(std::deque<Response>& responses,
   }
 }
 
-int64_t Controller::TotalByteSizeOfAllgatherOutput(
+void Controller::SetTensorByteSizesForAllgatheredTensors(
+    std::vector<int64_t>& tensor_byte_sizes,
     const std::vector<int64_t>& tensor_sizes, const TensorTableEntry& entry) {
-  int64_t total_dimension_size = 0;
-  for (auto sz : tensor_sizes) {
-    total_dimension_size += sz;
-  }
   // Every tensor participating in Allgather operation may have
   // different first dimension size, but the rest of dimensions are same
-  // for all tensors.  Here we get shape of tensor sliced by first
-  // dimension. Allgather output will have shape of: (sum of first
-  // dimension of every tensor) x (tensor slice shape).
-  int64_t total_count_of_output_entries = total_dimension_size;
+  // for all tensors.
+  int64_t outer_dimensions_factor = 1;
   for (int i = 1; i < entry.tensor->shape().dims(); ++i) {
-    total_count_of_output_entries *= entry.tensor->shape().dim_size(i);
+    outer_dimensions_factor *= entry.tensor->shape().dim_size(i);
   }
   int element_size = GetTypeSize(entry.tensor->dtype());
-  int64_t total_byte_size_of_output =
-      total_count_of_output_entries * element_size;
 
-  return total_byte_size_of_output;
+  tensor_byte_sizes.clear();
+  for (auto sz : tensor_sizes) {
+    tensor_byte_sizes.push_back(sz * outer_dimensions_factor * element_size);
+  }
 }
 
 int Controller::GetLocalSizeAtCrossRank(int i) {
@@ -987,14 +1123,7 @@ bool Controller::IncrementTensorCount(const Request& msg, int joined_size) {
     timeline_.NegotiateStart(name, msg.request_type());
   } else {
     std::vector<Request>& messages = table_iter->second;
-    if(msg.request_type() == Request::BARRIER) {
-      if(tensor_queue_.IsTensorPresentInTable(name)) {
-        messages.push_back(msg);
-      }
-    }
-    else {
-      messages.push_back(msg);
-    }
+    messages.push_back(msg);
   }
 
   timeline_.NegotiateRankReady(name, msg.request_rank());

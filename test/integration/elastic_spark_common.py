@@ -354,6 +354,7 @@ class BaseElasticSparkTests(unittest.TestCase):
         super(BaseElasticSparkTests, self).__init__(*args, **kwargs)
         warnings.simplefilter('module')
         logging.getLogger('py4j.java_gateway').setLevel(logging.INFO)
+        logging.getLogger('py4j.clientserver').setLevel(logging.INFO)
 
     @staticmethod
     def _exec(cmd):
@@ -362,8 +363,8 @@ class BaseElasticSparkTests(unittest.TestCase):
             raise RuntimeError('executed command returned non-zero exit code: {}'.format(exit_code))
 
     def _run(self, discovery_schedule=None, exit_schedule=None, hosts=None,
-             discovery_wait=10, epoch_wait=None, epochs=None,
-             np=2, min_np=None, max_np=None, extra_conf=None):
+             discovery_wait=30, epoch_wait=None, epochs=None,
+             num_proc=2, min_num_proc=None, max_num_proc=None, extra_conf=None):
         with temppath() as logfile:
             with spark_cluster(logfile=logfile, discovery_schedule=discovery_schedule,
                                hosts=hosts, extra_conf=extra_conf):
@@ -380,9 +381,9 @@ class BaseElasticSparkTests(unittest.TestCase):
 
                 cmd = ' '.join(command)
                 run_elastic(self._exec, (cmd,), env={'HOROVOD_LOG_LEVEL': 'DEBUG'},
-                            num_proc=np, min_np=min_np, max_np=max_np,
+                            num_proc=num_proc, min_num_proc=min_num_proc, max_num_proc=max_num_proc,
                             stdout=sys.stdout, stderr=sys.stderr,
-                            start_timeout=10, elastic_timeout=10, verbose=2,
+                            start_timeout=30, elastic_timeout=30, verbose=2,
                             prefix_output_with_timestamp=True)
 
                 with open(logfile, 'r') as f:
@@ -400,7 +401,7 @@ class BaseElasticSparkTests(unittest.TestCase):
 
         epochs = 10
         self.assertGreater(epochs, 0, 'test should not be trivial')
-        results = self._run(hosts=hosts, np=5, min_np=5, max_np=5, epochs=epochs)
+        results = self._run(hosts=hosts, num_proc=5, min_num_proc=5, max_num_proc=5, epochs=epochs)
 
         self.assertEqual(epochs, len(results))
 
@@ -424,8 +425,8 @@ class BaseElasticSparkTests(unittest.TestCase):
 
         # don't wait for discovery of new hosts but have epochs be long enough to see hosts changes
         results = self._run(discovery_schedule=discovery_schedule, discovery_wait=0, epoch_wait=10,
-                            np=2, extra_conf=[conf.SPARK_CONF_ALWAYS_RESTART_FAILED_TASK,
-                                              conf.SPARK_CONF_BLACKLIST_DISABLED])
+                            num_proc=2, extra_conf=[conf.SPARK_CONF_ALWAYS_RESTART_FAILED_TASK,
+                                                    conf.SPARK_CONF_BLACKLIST_DISABLED])
 
         self.assertEqual(3, len(results))
 
@@ -484,8 +485,8 @@ class BaseElasticSparkTests(unittest.TestCase):
 
         # don't wait for discovery of new hosts but have epochs be long enough to see hosts changes
         results = self._run(discovery_schedule=discovery_schedule, discovery_wait=0, epoch_wait=10,
-                            np=2, extra_conf=[conf.SPARK_CONF_ALWAYS_RESTART_FAILED_TASK,
-                                              conf.SPARK_CONF_BLACKLIST_DISABLED])
+                            num_proc=2, extra_conf=[conf.SPARK_CONF_ALWAYS_RESTART_FAILED_TASK,
+                                                    conf.SPARK_CONF_BLACKLIST_DISABLED])
 
         self.assertEqual(3, len(results))
 
@@ -515,7 +516,7 @@ class BaseElasticSparkTests(unittest.TestCase):
             str((1, 0)): [0],
         }
 
-        results = self._run(hosts=hosts, exit_schedule=exit_schedule, np=2,
+        results = self._run(hosts=hosts, exit_schedule=exit_schedule, num_proc=2,
                             extra_conf=[conf.SPARK_CONF_ALWAYS_RESTART_FAILED_TASK,
                                         conf.SPARK_CONF_BLACKLIST_DISABLED])
 
@@ -544,7 +545,7 @@ class BaseElasticSparkTests(unittest.TestCase):
         """
         Same as test_fault_tolerance_no_spark_blacklist except Spark blacklists the executor
         that has the failing task, so that there are not enough executors available after the
-        exception. Then, Horovod will timeout waiting for np=2 cores.
+        exception. Then, Horovod will timeout waiting for num_proc=2 cores.
         """
         hosts = 'host-1:1,host-2:1'
 
@@ -554,7 +555,7 @@ class BaseElasticSparkTests(unittest.TestCase):
 
         message = 'Horovod detected that one or more processes exited with non-zero status'
         with pytest.raises(RuntimeError, match=message):
-            self._run(hosts=hosts, exit_schedule=exit_schedule, np=2,
+            self._run(hosts=hosts, exit_schedule=exit_schedule, num_proc=2,
                       extra_conf=[conf.SPARK_CONF_ALWAYS_RESTART_FAILED_TASK,
                                   conf.SPARK_CONF_BLACKLIST_ENABLED, setting])
 
@@ -566,7 +567,7 @@ class BaseElasticSparkTests(unittest.TestCase):
             str((1, 0)): [0],
         }
 
-        results = self._run(hosts=hosts, exit_schedule=exit_schedule, np=2, min_np=2, max_np=2,
+        results = self._run(hosts=hosts, exit_schedule=exit_schedule, num_proc=2, min_num_proc=2, max_num_proc=2,
                             extra_conf=[conf.SPARK_CONF_ALWAYS_RESTART_FAILED_TASK,
                                         conf.SPARK_CONF_BLACKLIST_DISABLED])
 
@@ -608,7 +609,7 @@ class BaseElasticSparkTests(unittest.TestCase):
 
         message = 'Horovod detected that one or more processes exited with non-zero status'
         with pytest.raises(RuntimeError, match=message):
-            self._run(hosts=hosts, exit_schedule=exit_schedule, np=2,
+            self._run(hosts=hosts, exit_schedule=exit_schedule, num_proc=2,
                       extra_conf=[conf.SPARK_CONF_ALWAYS_RESTART_FAILED_TASK,
                                   conf.SPARK_CONF_BLACKLIST_ENABLED,
                                   conf.SPARK_CONF_DONT_REUSE_FAILED_EXECUTOR])
@@ -641,7 +642,7 @@ class BaseElasticSparkTests(unittest.TestCase):
             (None, ['host-1:1', 'host-2:1', 'host-3:1']),
         ]
 
-        results = self._run(discovery_schedule=discovery_schedule, np=1, min_np=1, max_np=5)
+        results = self._run(discovery_schedule=discovery_schedule, num_proc=1, min_num_proc=1, max_num_proc=5)
 
         self.assertEqual(3, len(results))
 
@@ -667,7 +668,7 @@ class BaseElasticSparkTests(unittest.TestCase):
             (None, ['host-2:1']),
         ]
 
-        results = self._run(discovery_schedule=discovery_schedule, np=3, min_np=1, max_np=4,
+        results = self._run(discovery_schedule=discovery_schedule, num_proc=3, min_num_proc=1, max_num_proc=4,
                             # TODO: remove these waits when discovery publishes failure right-away
                             #       currently, spark discovery does not know about failing nodes
                             #       test setup makes node wait for this change without these waits
@@ -696,7 +697,7 @@ class BaseElasticSparkTests(unittest.TestCase):
             str((2, 0)): [1],
         }
 
-        results = self._run(hosts=hosts, exit_schedule=exit_schedule, np=4, min_np=1,
+        results = self._run(hosts=hosts, exit_schedule=exit_schedule, num_proc=4, min_num_proc=1,
                             extra_conf=[conf.SPARK_CONF_ALWAYS_RESTART_FAILED_TASK])
 
         self.assertEqual(3, len(results))
@@ -729,7 +730,7 @@ class BaseElasticSparkTests(unittest.TestCase):
         }
 
         # it can take 5 seconds for a task to be restarted by Spark, so we make each epoch take 10s
-        results = self._run(hosts=hosts, exit_schedule=exit_schedule, epoch_wait=10, np=4, min_np=1,
+        results = self._run(hosts=hosts, exit_schedule=exit_schedule, epoch_wait=10, num_proc=4, min_num_proc=1,
                             extra_conf=[conf.SPARK_CONF_ALWAYS_RESTART_FAILED_TASK,
                                         conf.SPARK_CONF_BLACKLIST_DISABLED])
 
@@ -768,7 +769,7 @@ class BaseElasticSparkTests(unittest.TestCase):
 
         # it can take 5 seconds for a task to be restarted by Spark, so we make each epoch take 10s
         results = self._run(hosts=hosts, exit_schedule=exit_schedule,
-                            epoch_wait=10, epochs=2, np=4, min_np=1,
+                            epoch_wait=10, epochs=2, num_proc=4, min_num_proc=1,
                             extra_conf=[conf.SPARK_CONF_ALWAYS_RESTART_FAILED_TASK,
                                         conf.SPARK_CONF_BLACKLIST_ENABLED, setting])
 

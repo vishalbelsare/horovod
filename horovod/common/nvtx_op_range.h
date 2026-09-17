@@ -13,9 +13,13 @@ enum class RegisteredNvtxOp {
   HorovodAllreduce = 0,
   HorovodGroupedAllreduce,
   HorovodAllgather,
+  HorovodGroupedAllgather,
   HorovodBroadcast,
   HorovodAlltoall,
-  // Insert new enum values above this line
+  HorovodReducescatter,
+  HorovodGroupedReducescatter,
+  // Insert values for new ops above this line. Also add corresponding
+  // REGISTER_STRING lines in the constructor NvtxOpsHandle::NvtxOpsHandle().
   END,
 };
 

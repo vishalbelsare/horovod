@@ -1,10 +1,12 @@
 .. raw:: html
 
+    <p>Due to inactivity, this project was archived in September 2026. The contents will remain available for historical purposes.</p>
     <p align="center"><img src="https://user-images.githubusercontent.com/16640218/34506318-84d0c06c-efe0-11e7-8831-0425772ed8f2.png" alt="Logo" width="200"/></p>
     <br/>
 
-Horovod
-=======
+
+Horovod (inactive)
+==================
 
 .. raw:: html
 
@@ -115,7 +117,7 @@ scale.
 
 Install
 -------
-To install Horovod:
+To install Horovod on Linux or macOS:
 
 1. Install `CMake <https://cmake.org/install/>`__
 
@@ -124,6 +126,7 @@ To install Horovod:
     <p/>
 
 2. If you've installed TensorFlow from `PyPI <https://pypi.org/project/tensorflow>`__, make sure that ``g++-5`` or above is installed.
+   Starting with TensorFlow 2.10 a C++17-compliant compiler like ``g++8`` or above will be required.
 
    If you've installed PyTorch from `PyPI <https://pypi.org/project/torch>`__, make sure that ``g++-5`` or above is installed.
 
@@ -296,7 +299,7 @@ See `Run Horovod <docs/running.rst>`_ for more details, including RoCE/InfiniBan
 
 4. To run in Docker, see `Horovod in Docker <docs/docker.rst>`_.
 
-5. To run on Kubernetes, see `Kubeflow MPI Operator <https://github.com/kubeflow/mpi-operator/>`_, `Helm Chart <https://github.com/kubernetes/charts/tree/master/stable/horovod/>`_, `FfDL <https://github.com/IBM/FfDL/tree/master/etc/examples/horovod/>`_, and `Polyaxon <https://docs.polyaxon.com/integrations/horovod/>`_.
+5. To run on Kubernetes, see `Helm Chart <https://github.com/horovod/horovod/tree/master/docker/helm/>`_, `Kubeflow MPI Operator <https://github.com/kubeflow/mpi-operator/>`_, `FfDL <https://github.com/IBM/FfDL/tree/master/etc/examples/horovod/>`_, and `Polyaxon <https://docs.polyaxon.com/integrations/horovod/>`_.
 
 6. To run on Spark, see `Horovod on Spark <docs/spark.rst>`_.
 
@@ -449,6 +452,7 @@ Getting Involved
 - `Community Slack <https://forms.gle/cPGvty5hp31tGfg79>`_ for collaboration and discussion
 - `Horovod Announce <https://lists.lfai.foundation/g/horovod-announce>`_ for updates on the project
 - `Horovod Technical-Discuss <https://lists.lfai.foundation/g/horovod-technical-discuss>`_ for public discussion
+- `Horovod Security <https://lists.lfai.foundation/g/horovod-security>`_ to report security vulnerabilities
 
 
 .. inclusion-marker-end-do-not-remove

@@ -1,19 +1,17 @@
-cmake_minimum_required(VERSION 2.8.12 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.13 FATAL_ERROR)
 if(POLICY CMP0074)
     # 1. Introduced with 3.12.4.
     # 2. *_ROOT variables will be checked
     cmake_policy(SET CMP0074 NEW)
 endif()
 
-if(${CMAKE_VERSION} VERSION_GREATER "3.4.0") 
-  find_program(CCACHE_PROGRAM ccache)
-  if(CCACHE_PROGRAM)
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
     set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
     set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
     set(CMAKE_CUDA_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
-  else()
+else()
     message(STATUS "Could not find CCache. Consider installing CCache to speed up compilation.")
-  endif()
 endif()
 
 project(horovod CXX)
@@ -23,7 +21,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Configure path to modules (for find_package)
-set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${PROJECT_SOURCE_DIR}/cmake/Modules/")
+set(CMAKE_MODULE_PATH
+        ${CMAKE_MODULE_PATH}
+        "${PROJECT_SOURCE_DIR}/cmake/Modules/"
+        "${PROJECT_SOURCE_DIR}/cmake/upstream/")
 include(cmake/Utilities.cmake)
 
 create_metadata()
@@ -109,8 +110,9 @@ set_gpu_op(HOROVOD_GPU_ALLREDUCE "MPI;NCCL;DDL")
 set_gpu_op(HOROVOD_GPU_ALLGATHER "MPI;NCCL")
 set_gpu_op(HOROVOD_GPU_BROADCAST "MPI;NCCL")
 set_gpu_op(HOROVOD_GPU_ALLTOALL "MPI;NCCL")
+set_gpu_op(HOROVOD_GPU_REDUCESCATTER "MPI;NCCL")
 
-foreach(VAR in ITEMS HOROVOD_GPU_ALLREDUCE HOROVOD_GPU_ALLGATHER HOROVOD_GPU_BROADCAST HOROVOD_GPU_ALLTOALL)
+foreach(VAR in ITEMS HOROVOD_GPU_ALLREDUCE HOROVOD_GPU_ALLGATHER HOROVOD_GPU_BROADCAST HOROVOD_GPU_ALLTOALL HOROVOD_GPU_REDUCESCATTER)
     if(DEFINED ${VAR})
         string(SUBSTRING ${${VAR}} 0 1 ${VAR})
         convert_to_ascii_dec(ASCII_DEC ${${VAR}})
@@ -148,14 +150,36 @@ if (NOT "$ENV{HOROVOD_WITHOUT_MPI}" STREQUAL "1")
 endif()
 
 # CUDA and ROCM
-macro(ADD_CUDA)
-    if (DEFINED ENV{HOROVOD_CUDA_HOME})
-        set(CUDA_TOOLKIT_ROOT_DIR $ENV{HOROVOD_CUDA_HOME})
+set(CMAKE_CUDA_HOST_COMPILER "${CMAKE_CXX_COMPILER}")
+if(NOT DEFINED CMAKE_CUDA_RUNTIME_LIBRARY)
+    set(CMAKE_CUDA_RUNTIME_LIBRARY "Static")  # Set to "Static" or "Shared", effective from CMake 3.17
+endif()
+if(DEFINED ENV{HOROVOD_CUDA_HOME})
+    set(CMAKE_CUDA_COMPILER "$ENV{HOROVOD_CUDA_HOME}/bin/nvcc")
+endif()
+include(CheckLanguage)
+check_language(CUDA)
+if(NOT CMAKE_CUDA_COMPILER)
+    find_package(CUDAToolkit)
+    if(CUDAToolkit_BIN_DIR)
+        message("CUDA compiler was not found in $PATH, but searching again in CUDA Toolkit binary directory")
+        unset(CMAKE_CUDA_COMPILER CACHE)  # need to clear this from cache, else some versions of CMake go into an infinite loop
+        set(CMAKE_CUDA_COMPILER "${CUDAToolkit_BIN_DIR}/nvcc")
+        check_language(CUDA)
     endif()
-    option(CUDA_USE_STATIC_CUDA_RUNTIME "Use the static version of the CUDA runtime library if available" OFF)
-    find_package(CUDA REQUIRED)
-    include_directories(SYSTEM ${CUDA_INCLUDE_DIRS})
-    list(APPEND LINKER_LIBS ${CUDA_LIBRARIES})
+endif()
+if(CMAKE_CUDA_COMPILER)
+    if((CMAKE_CXX_COMPILER_ID MATCHES GNU) AND (CMAKE_SYSTEM_PROCESSOR MATCHES ppc64le))
+        if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 8.0)
+            set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -std=c++11")
+        endif()
+    endif()
+    enable_language(CUDA)
+endif()
+
+macro(ADD_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    include_directories(SYSTEM ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     list(APPEND SOURCES "${PROJECT_SOURCE_DIR}/horovod/common/ops/cuda_operations.cc"
                         "${PROJECT_SOURCE_DIR}/horovod/common/ops/gpu_operations.cc")
     # CUDA + MPI
@@ -169,7 +193,7 @@ macro(ADD_CUDA)
     endif()
 endmacro()
 
-if(DEFINED HOROVOD_GPU_ALLREDUCE OR DEFINED HOROVOD_GPU_ALLGATHER OR DEFINED HOROVOD_GPU_BROADCAST OR DEFINED HOROVOD_GPU_ALLTOALL)
+if(DEFINED HOROVOD_GPU_ALLREDUCE OR DEFINED HOROVOD_GPU_ALLGATHER OR DEFINED HOROVOD_GPU_BROADCAST OR DEFINED HOROVOD_GPU_ALLTOALL OR DEFINED HOROVOD_GPU_REDUCESCATTER)
     if(NOT DEFINED HOROVOD_GPU OR HOROVOD_GPU STREQUAL "CUDA")
         add_cuda()
     elseif(HOROVOD_GPU STREQUAL "ROCM")
@@ -179,6 +203,9 @@ if(DEFINED HOROVOD_GPU_ALLREDUCE OR DEFINED HOROVOD_GPU_ALLGATHER OR DEFINED HOR
         set(CMAKE_CXX_FLAGS "${ROCM_COMPILE_FLAGS} ${CMAKE_CXX_FLAGS}")
         list(APPEND SOURCES "${PROJECT_SOURCE_DIR}/horovod/common/ops/hip_operations.cc"
                             "${PROJECT_SOURCE_DIR}/horovod/common/ops/gpu_operations.cc")
+        if(HAVE_MPI)
+            list(APPEND SOURCES "${PROJECT_SOURCE_DIR}/horovod/common/ops/mpi_gpu_operations.cc")
+        endif()
         add_definitions(-DHAVE_ROCM=1 -DHAVE_GPU=1)
         set(HAVE_ROCM TRUE)
     else()
@@ -187,7 +214,7 @@ if(DEFINED HOROVOD_GPU_ALLREDUCE OR DEFINED HOROVOD_GPU_ALLGATHER OR DEFINED HOR
 endif()
 
 # NCCL
-if(HOROVOD_GPU_ALLREDUCE STREQUAL "N" OR HOROVOD_GPU_ALLGATHER STREQUAL "N" OR HOROVOD_GPU_BROADCAST STREQUAL "N" OR HOROVOD_GPU_ALLTOALL STREQUAL "N")
+if(HOROVOD_GPU_ALLREDUCE STREQUAL "N" OR HOROVOD_GPU_ALLGATHER STREQUAL "N" OR HOROVOD_GPU_BROADCAST STREQUAL "N" OR HOROVOD_GPU_ALLTOALL STREQUAL "N" OR HOROVOD_GPU_REDUCESCATTER STREQUAL "N")
     if(HAVE_ROCM)
         find_package(rccl REQUIRED)
         include_directories(SYSTEM ${RCCL_INCLUDE_DIRS})
@@ -197,8 +224,19 @@ if(HOROVOD_GPU_ALLREDUCE STREQUAL "N" OR HOROVOD_GPU_ALLGATHER STREQUAL "N" OR H
         if (NCCL_MAJOR_VERSION LESS "2")
             message(FATAL_ERROR "Horovod requires NCCL 2.0 or later version please upgrade.")
         endif()
+        string(TOLOWER "${CMAKE_CUDA_RUNTIME_LIBRARY}" lowercase_CMAKE_CUDA_RUNTIME_LIBRARY)
+        get_filename_component(NCCL_LIBRARY_FILE_NAME ${NCCL_LIBRARIES} NAME)
+        if (CMAKE_VERSION VERSION_GREATER_EQUAL 3.17
+            AND lowercase_CMAKE_CUDA_RUNTIME_LIBRARY STREQUAL "shared"
+            AND NCCL_LIBRARY_FILE_NAME MATCHES "static")
+            message(WARNING "Linking NCCL statically, but linking CUDA runtime library dynamically. This combination is not supported with typical builds of NCCL.")
+        endif()
         include_directories(SYSTEM ${NCCL_INCLUDE_DIRS})
         list(APPEND LINKER_LIBS ${NCCL_LIBRARIES})
+        if(NCCL_LIBRARY_FILE_NAME MATCHES "static" AND lowercase_CMAKE_CUDA_RUNTIME_LIBRARY STREQUAL "static")
+            # ensure that weak symbols from NCCL's enhcompat.cc are properly overwritten by symbols from libcudart_static.a (https://github.com/horovod/horovod/pull/3846)
+            list(APPEND LINKER_LIBS -Wl,--whole-archive cudart_static -Wl,--no-whole-archive)
+        endif()
     endif()
     list(APPEND SOURCES "${PROJECT_SOURCE_DIR}/horovod/common/ops/nccl_operations.cc")
     add_definitions(-DHAVE_NCCL=1)
@@ -209,7 +247,7 @@ endif()
 if(HOROVOD_GPU_ALLREDUCE STREQUAL "D")
     message(DEPRECATION "DDL backend has been deprecated. Please, start using the NCCL backend by building Horovod with "
                         "'HOROVOD_GPU_OPERATIONS=NCCL'. Will be removed in v0.21.0.")
-    list(APPEND LINKER_LIBS "${CUDA_TOOLKIT_ROOT_DIR}/lib/libddl.so" "${CUDA_TOOLKIT_ROOT_DIR}/lib/libddl_pack.so")
+    list(APPEND LINKER_LIBS "${CUDAToolkit_LIBRARY_DIR}/libddl.so" "${CUDAToolkit_LIBRARY_DIR}/libddl_pack.so")
     list(APPEND SOURCES "${PROJECT_SOURCE_DIR}/horovod/common/mpi/ddl_mpi_context_manager.cc"
                         "${PROJECT_SOURCE_DIR}/horovod/common/ops/ddl_operations.cc")
     add_definitions(-DHAVE_DDL=1)
@@ -228,7 +266,7 @@ if(DEFINED CCL_ROOT)
 endif()
 
 set(HOROVOD_ALLOW_MIXED_GPU_IMPL $ENV{HOROVOD_ALLOW_MIXED_GPU_IMPL})
-if(HOROVOD_GPU_ALLREDUCE STREQUAL "N" AND (HOROVOD_GPU_ALLGATHER STREQUAL "M" OR HOROVOD_GPU_BROADCAST STREQUAL "M" OR HOROVOD_GPU_ALLTOALL STREQUAL "M") AND
+if(HOROVOD_GPU_ALLREDUCE STREQUAL "N" AND (HOROVOD_GPU_ALLGATHER STREQUAL "M" OR HOROVOD_GPU_BROADCAST STREQUAL "M" OR HOROVOD_GPU_ALLTOALL STREQUAL "M" OR HOROVOD_GPU_REDUCESCATTER STREQUAL "M") AND
    NOT HOROVOD_ALLOW_MIXED_GPU_IMPL STREQUAL "1")
 message(FATAL_ERROR "You should not mix NCCL and MPI GPU due to a possible deadlock.\n"
                     "If you are sure you want to mix them, set the "
@@ -321,6 +359,10 @@ if(HAVE_CUDA OR HAVE_SUB_PROJECT_CUDA)
     add_subdirectory(horovod/common/ops/cuda)
 endif()
 
+if(HAVE_ROCM)
+    add_subdirectory(horovod/common/ops/rocm)
+endif()
+
 # if we need compatible c++ abi
 # Duplicate gloo folder and add it as a new sub-project
 if(HAVE_GLOO AND ((DEFINED Tensorflow_CXX11 AND NOT Tensorflow_CXX11) OR (DEFINED Pytorch_CXX11 AND NOT Pytorch_CXX11) OR (DEFINED Mxnet_CXX11 AND NOT Mxnet_CXX11)))
@@ -330,4 +372,22 @@ if(HAVE_GLOO AND ((DEFINED Tensorflow_CXX11 AND NOT Tensorflow_CXX11) OR (DEFINE
     file(WRITE ${PROJECT_SOURCE_DIR}/third_party/compatible_gloo/gloo/CMakeLists.txt "${GLOO_CMAKE}")
     add_subdirectory(third_party/compatible_gloo)
     target_compile_definitions(compatible_gloo PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
+endif()
+
+# Gloo for c++17 TF
+if(HAVE_GLOO AND ((DEFINED Tensorflow_CXX17 AND Tensorflow_CXX17) OR (DEFINED Pytorch_CXX17 AND Pytorch_CXX17)))
+    file(COPY ${PROJECT_SOURCE_DIR}/third_party/gloo/ DESTINATION ${PROJECT_SOURCE_DIR}/third_party/compatible17_gloo)
+    file(READ ${PROJECT_SOURCE_DIR}/third_party/compatible17_gloo/gloo/CMakeLists.txt GLOO_CMAKE)
+    string(REPLACE "gloo " "compatible17_gloo " GLOO_CMAKE "${GLOO_CMAKE}")
+    file(WRITE ${PROJECT_SOURCE_DIR}/third_party/compatible17_gloo/gloo/CMakeLists.txt "${GLOO_CMAKE}")
+    file(READ ${PROJECT_SOURCE_DIR}/third_party/compatible17_gloo/CMakeLists.txt GLOO_CMAKE)
+    string(REPLACE "-std=c++11" "-std=c++17" GLOO_CMAKE "${GLOO_CMAKE}")
+    string(PREPEND GLOO_CMAKE "set(CMAKE_CXX_STANDARD 17)\n")
+    file(WRITE ${PROJECT_SOURCE_DIR}/third_party/compatible17_gloo/CMakeLists.txt "${GLOO_CMAKE}")
+    add_subdirectory(third_party/compatible17_gloo)
+    if (Tensorflow_CXX11 OR Pytorch_CXX11)
+        target_compile_definitions(compatible17_gloo PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
+    else()
+       target_compile_definitions(compatible17_gloo PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
+    endif()
 endif()

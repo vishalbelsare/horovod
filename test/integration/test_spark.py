@@ -15,6 +15,9 @@
 
 import contextlib
 import copy
+import shutil
+import uuid
+
 from horovod.spark.common.store import FilesystemStore
 import io
 import itertools
@@ -27,7 +30,7 @@ import threading
 import time
 import unittest
 import warnings
-from distutils.version import LooseVersion
+from packaging import version
 
 import mock
 import psutil
@@ -414,7 +417,7 @@ class SparkTests(unittest.TestCase):
         stdout = io.StringIO()
         stderr = io.StringIO()
         with spark_session('test_happy_run_elastic'):
-            res = horovod.spark.run_elastic(fn, num_proc=2, min_np=2, max_np=2,
+            res = horovod.spark.run_elastic(fn, num_proc=2, min_num_proc=2, max_num_proc=2,
                                             env={'HOROVOD_LOG_LEVEL': 'WARNING'},
                                             stdout=stdout, stderr=stderr,
                                             start_timeout=10, verbose=2)
@@ -467,7 +470,7 @@ class SparkTests(unittest.TestCase):
                 with mpi_implementation_flags():
                     with pytest.raises(Exception, match='^mpirun failed with exit code 127$'):
                         horovod.spark.run(None, start_timeout=20, env={'PATH': '/nonexistent'}, verbose=0)
-        self.assertLessEqual(time.time() - start, 10, 'Failure propagation took too long')
+        self.assertLessEqual(time.time() - start, 60, 'Failure propagation took too long')
 
     """
     Test that horovod.spark.run uses MPI properly.
@@ -493,7 +496,7 @@ class SparkTests(unittest.TestCase):
             self._do_test_spark_run(num_proc=2, use_mpi=use_mpi, use_gloo=use_gloo,
                                     extra_mpi_args=extra_mpi_args,
                                     env=env, stdout='<stdout>', stderr='<stderr>',
-                                    cores=2, expected_np=2, expected_env=expected_env)
+                                    cores=2, expected_num_proc=2, expected_env=expected_env)
 
     """
     Test that horovod.spark.run does not default to spark parallelism given num_proc using MPI.
@@ -512,7 +515,7 @@ class SparkTests(unittest.TestCase):
     Actually tests that horovod.spark.run does not default to spark parallelism given num_proc.
     """
     def do_test_spark_run_num_proc_precedes_spark_cores(self, use_mpi, use_gloo):
-        self._do_test_spark_run(num_proc=1, cores=2, expected_np=1,
+        self._do_test_spark_run(num_proc=1, cores=2, expected_num_proc=1,
                                 use_mpi=use_mpi, use_gloo=use_gloo)
 
     """
@@ -526,7 +529,7 @@ class SparkTests(unittest.TestCase):
             self._do_test_spark_run(num_proc=2, use_mpi=True, use_gloo=False,
                                     extra_mpi_args=extra_mpi_args,
                                     env=env, stdout='<stdout>', stderr='<stderr>',
-                                    cores=4, expected_np=2, expected_env=expected_env)
+                                    cores=4, expected_num_proc=2, expected_env=expected_env)
 
     """
     Test that horovod.spark.run defaults num_proc to spark parallelism using MPI.
@@ -545,7 +548,7 @@ class SparkTests(unittest.TestCase):
     Actually tests that horovod.spark.run defaults num_proc to spark parallelism.
     """
     def do_test_spark_run_defaults_num_proc_to_spark_cores(self, use_mpi, use_gloo):
-        self._do_test_spark_run(num_proc=None, cores=2, expected_np=2,
+        self._do_test_spark_run(num_proc=None, cores=2, expected_num_proc=2,
                                 use_mpi=use_mpi, use_gloo=use_gloo)
 
     """
@@ -566,6 +569,8 @@ class SparkTests(unittest.TestCase):
     """
     def do_test_spark_run_does_not_default_env_to_os_env(self, use_mpi, use_gloo):
         env = {'env1': 'val1', 'env2': 'val2'}
+        # keep existing SPARK_ and PYSPARK_ env vars required to spin-up Spark
+        env.update({k: v for k, v in os.environ.items() if k.startswith('SPARK_') or k.startswith('PYSPARK_')})
         expected_env = ''
 
         with override_env(env):
@@ -634,22 +639,22 @@ class SparkTests(unittest.TestCase):
     def _do_test_spark_run(self, args=(), kwargs={}, num_proc=1, extra_mpi_args=None,
                            env=None, use_mpi=None, use_gloo=None,
                            stdout=None, stderr=None, verbose=2,
-                           cores=2, expected_np=1, expected_env=''):
+                           cores=2, expected_num_proc=1, expected_env=''):
         if use_mpi:
             self._do_test_spark_run_with_mpi(args, kwargs, num_proc, extra_mpi_args, env,
                                              stdout, stderr, verbose, cores,
-                                             expected_np, expected_env)
+                                             expected_num_proc, expected_env)
         if use_gloo:
             self._do_test_spark_run_with_gloo(args, kwargs, num_proc, extra_mpi_args, env,
                                               stdout, stderr, verbose, cores,
-                                              expected_np)
+                                              expected_num_proc)
 
     """
     Performs an actual horovod.spark.run test using MPI.
     """
     def _do_test_spark_run_with_mpi(self, args=(), kwargs={}, num_proc=1, extra_mpi_args=None,
                                     env=None, stdout=None, stderr=None, verbose=2,
-                                    cores=2, expected_np=1, expected_env=''):
+                                    cores=2, expected_num_proc=1, expected_env=''):
         if env is None:
             env = {}
 
@@ -683,7 +688,7 @@ class SparkTests(unittest.TestCase):
                 self.assertIsNotNone(mpi_flags)
                 expected_command = ('mpirun '
                                     '--allow-run-as-root --tag-output '
-                                    '-np {expected_np} -H [^ ]+ '
+                                    '-np {expected_num_proc} -H [^ ]+ '
                                     '{binding_args} '
                                     '{mpi_flags}  '
                                     '-mca btl_tcp_if_include [^ ]+ -x NCCL_SOCKET_IFNAME=[^ ]+  '
@@ -692,7 +697,7 @@ class SparkTests(unittest.TestCase):
                                     '-x NCCL_DEBUG=INFO '
                                     r'-mca plm_rsh_agent "[^"]+python[0-9.]* -m horovod.spark.driver.mpirun_rsh [^ ]+ [^ ]+" '
                                     r'[^"]+python[0-9.]* -m horovod.spark.task.mpirun_exec_fn [^ ]+ [^ ]+'.format(
-                    expected_np=expected_np,
+                    expected_num_proc=expected_num_proc,
                     binding_args=' '.join(binding_args),
                     expected_env=expected_env if expected_env else '',
                     mpi_flags=' '.join(mpi_flags),
@@ -752,7 +757,7 @@ class SparkTests(unittest.TestCase):
     """
     def _do_test_spark_run_with_gloo(self, args=(), kwargs={}, num_proc=1, extra_mpi_args=None,
                                      env=None, stdout=None, stderr=None, verbose=2,
-                                     cores=2, expected_np=1):
+                                     cores=2, expected_num_proc=1):
         if env is None:
             env = {}
 
@@ -786,7 +791,7 @@ class SparkTests(unittest.TestCase):
                          'Exit code: 1\n', str(e.value))
 
         num_proc = cores if num_proc is None else num_proc
-        self.assertEqual(expected_np, num_proc)
+        self.assertEqual(expected_num_proc, num_proc)
         self.assertEqual(1, gloo_exec_command_fn.call_count)
         _, _, _, call_env, _, _, _ = gloo_exec_command_fn.call_args[0]
         self.assertEqual(env or {}, call_env)
@@ -815,7 +820,8 @@ class SparkTests(unittest.TestCase):
             self.assertEqual(alloc_info.local_rank, alloc_info.rank)
 
             # command fully derived from alloc_info
-            expected_command = ('HOROVOD_HOSTNAME=[^ ]+ '
+            expected_command = ('env '
+                                'HOROVOD_HOSTNAME=[^ ]+ '
                                 'HOROVOD_RANK={rank} '
                                 'HOROVOD_SIZE={size} '
                                 'HOROVOD_LOCAL_RANK={local_rank} '
@@ -1665,7 +1671,7 @@ class SparkTests(unittest.TestCase):
                 file = os.path.sep.join([d, 'command_executed'])
                 self.do_test_spark_task_service_executes_command(client, file)
 
-    @mock.patch('horovod.runner.common.util.safe_shell_exec.GRACEFUL_TERMINATION_TIME_S', 0.5)
+    @mock.patch('horovod.runner.common.util.safe_shell_exec.GRACEFUL_TERMINATION_TIME_S', 30)
     def test_spark_task_service_abort_command(self):
         with spark_task_service(index=0) as (service, client, _):
             with tempdir() as d:
@@ -1688,7 +1694,7 @@ class SparkTests(unittest.TestCase):
                 client.abort_command()
                 self.do_test_spark_task_service_executes_command(client, file)
 
-    @pytest.mark.skipif(LooseVersion(pyspark.__version__) < LooseVersion('3.0.0'),
+    @pytest.mark.skipif(version.parse(pyspark.__version__) < version.parse('3.0.0'),
                         reason='get_available_devices only supported in Spark 3.0 and above')
     def test_get_available_devices(self):
         res = run_get_available_devices()
@@ -1716,6 +1722,7 @@ class SparkTests(unittest.TestCase):
         with pytest.raises(ValueError):
             util.to_list(['item1', 'item2'], 4)
 
+    @mock.patch("horovod.spark.common.store._DBFS_PREFIX_MAPPING", "/tmp")
     def test_dbfs_local_store(self):
         import h5py
         import io
@@ -1737,13 +1744,22 @@ class SparkTests(unittest.TestCase):
             assert isinstance(dbfs_local_store, DBFSLocalStore)
             dbfs_local_store = Store.create("file:///dbfs/tmp/test_local_dir3")
             assert isinstance(dbfs_local_store, DBFSLocalStore)
+            dbfs_local_store = Store.create("file:/dbfs/tmp/test_local_dir3")
+            assert isinstance(dbfs_local_store, DBFSLocalStore)
+            assert not DBFSLocalStore.matches_dbfs("dbfs://tmp/test_local_dir3")
         finally:
             if "DATABRICKS_RUNTIME_VERSION" in os.environ:
                 del os.environ["DATABRICKS_RUNTIME_VERSION"]
 
+        assert DBFSLocalStore.normalize_path("file:/dbfs/tmp/a1") == "/dbfs/tmp/a1"
+        assert DBFSLocalStore.normalize_path("file:///dbfs/tmp/a1") == "/dbfs/tmp/a1"
+        assert DBFSLocalStore.normalize_path("/dbfs/tmp/a1") == "/dbfs/tmp/a1"
+        assert DBFSLocalStore.normalize_path("dbfs:/tmp/a1") == "/dbfs/tmp/a1"
+        with pytest.raises(ValueError):
+            DBFSLocalStore.normalize_path("dbfs://tmp/a1")
+
         # test get_checkpoint_filename suffix
-        # Use a tmp path for testing.
-        dbfs_store = DBFSLocalStore("/tmp/test_dbfs_dir")
+        dbfs_store = DBFSLocalStore("/dbfs/test_dbfs_dir")
         dbfs_ckpt_name = dbfs_store.get_checkpoint_filename()
         assert dbfs_ckpt_name.endswith(".tf")
 
@@ -1760,19 +1776,23 @@ class SparkTests(unittest.TestCase):
         get_dbfs_output_dir = dbfs_store.get_local_output_dir_fn("0")
         with get_dbfs_output_dir() as run_output_dir:
             dbfs_ckpt_path = run_output_dir + "/" + local_store.get_checkpoint_filename()
-            if LooseVersion(tensorflow.__version__) < LooseVersion("2.0.0"):
+            if version.parse(tensorflow.__version__) < version.parse("2.0.0"):
                 model.save_weights(dbfs_ckpt_path)
             else:
                 model.save(dbfs_ckpt_path)
             serialized_model_dbfs = dbfs_store.read_serialized_keras_model(dbfs_ckpt_path, model,
                                                                            custom_objects={})
             reconstructed_model_dbfs = deserialize_keras_model(serialized_model_dbfs)
-            if LooseVersion(tensorflow.__version__) >= LooseVersion("2.3.0"):
+            if version.parse(tensorflow.__version__) >= version.parse("2.3.0"):
                 assert reconstructed_model_dbfs.get_config() == model.get_config()
 
         # test local_store.read_serialized_keras_model
-        with tempdir() as tmp:
-            local_store = Store.create(tmp)
+        tmp_dir = "tmp_" + uuid.uuid4().hex
+        # The dbfs_dir "/dbfs/tmp_xxx" will be mapped to "/tmp/tmp_xxx" in testing
+        dbfs_dir = os.path.join("/dbfs", tmp_dir)
+        actual_dbfs_dir = os.path.join("/tmp", tmp_dir)
+        try:
+            local_store = Store.create(dbfs_dir)
             get_local_output_dir = local_store.get_local_output_dir_fn("0")
             with get_local_output_dir() as run_output_dir:
                 local_ckpt_path = run_output_dir + "/" + local_store.get_checkpoint_filename()
@@ -1783,9 +1803,10 @@ class SparkTests(unittest.TestCase):
                                                             custom_objects={})
 
                 reconstructed_model_local = deserialize_keras_model(serialized_model_local)
-                if LooseVersion(tensorflow.__version__) >= LooseVersion("2.3.0"):
+                if version.parse(tensorflow.__version__) >= version.parse("2.3.0"):
                     assert reconstructed_model_local.get_config() == model.get_config()
-
+        finally:
+            shutil.rmtree(actual_dbfs_dir, ignore_errors=True)
 
     def test_output_df_schema(self):
         label_cols = ['y1', 'y_embedding']

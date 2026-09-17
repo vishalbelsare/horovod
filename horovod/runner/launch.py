@@ -142,7 +142,7 @@ def check_build(verbose):
                ccl_ops=get_check(ccl_built(verbose=verbose)),
                gloo_ops=get_check(gloo_built(verbose=verbose)))
     print(textwrap.dedent(output))
-    os._exit(0)
+    sys.exit(0)
 
 
 def make_check_build_action(np_arg):
@@ -213,7 +213,7 @@ def make_override_false_action(override_args):
     return make_override_bool_action(override_args, False)
 
 
-def make_deprecated_bool_action(override_args, bool_value, replacement_option):
+def make_deprecated_bool_action(override_args, bool_value, replacement_option, remove_version):
     class StoreOverrideBoolAction(argparse.Action):
         def __init__(self,
                      option_strings,
@@ -231,12 +231,56 @@ def make_deprecated_bool_action(override_args, bool_value, replacement_option):
 
         def __call__(self, parser, args, values, option_string=None):
             deprecated_option = '|'.join(self.option_strings)
-            warnings.warn(f'Argument {deprecated_option} has been replaced by {replacement_option} and will be removed in v0.21.0',
+            warnings.warn(f'Argument {deprecated_option} has been replaced by {replacement_option} '
+                          f'and will be removed in {remove_version}',
                           DeprecationWarning)
             override_args.add(self.dest)
             setattr(args, self.dest, self.const)
 
     return StoreOverrideBoolAction
+
+
+def make_nic_action(deprecated):
+    # This is an append Action that splits the values on ','
+    # where that splitting can be marked deprecated, depending on the actual command line argument used
+    class NicAction(argparse.Action):
+        def __init__(self,
+                     option_strings,
+                     dest,
+                     default=None,
+                     type=None,
+                     choices=None,
+                     required=False,
+                     help=None):
+            super(NicAction, self).__init__(
+                option_strings=option_strings,
+                dest=dest,
+                nargs=1,
+                default=default,
+                type=type,
+                choices=choices,
+                required=required,
+                help=help)
+
+        def __call__(self, parser, args, values, option_string=None):
+            if ',' in values[0]:
+                if deprecated:
+                    # providing a list of interfaces is deprecated, so we warn but split it anyway
+                    warnings.warn(f'Providing multiple interfaces via --network-interface is deprecated. '
+                                  f'Please use --network-interfaces instead, or use '
+                                  f'multiple --network-interface arguments with a '
+                                  f'single network interface each.',
+                                  DeprecationWarning)
+                values = values[0].split(',')
+
+            # union the existing dest nics with the new ones
+            items = getattr(args, self.dest, None)
+            items = set() if items is None else items
+            items = items.union(values)
+
+            setattr(args, self.dest, items)
+
+    return NicAction
 
 
 def parse_args():
@@ -247,7 +291,7 @@ def parse_args():
     parser.add_argument('-v', '--version', action='version', version=horovod.__version__,
                         help='Shows Horovod version.')
 
-    np_arg = parser.add_argument('-np', '--num-proc', action='store', dest='np',
+    np_arg = parser.add_argument('-np', '--num-proc', action='store', dest='num_proc',
                                  type=int, required=not lsf.LSFUtils.using_lsf(),
                                  help='Total number of training processes. In elastic mode, '
                                       'number of processes required before training can start.')
@@ -272,10 +316,18 @@ def parse_args():
                              'HOROVOD_START_TIMEOUT can also be used to '
                              'specify the initialization timeout.')
 
-    parser.add_argument('--network-interface', action='store', dest='nics',
+    parser.add_argument('--network-interfaces', action=make_nic_action(deprecated=False), dest='nics',
                         help='Network interfaces that can be used for communication separated by '
                              'comma. If not specified, Horovod will find the common NICs among all '
-                             'the workers and use it; example, --network-interface "eth0,eth1".')
+                             'the workers. Also see --network-interface. '
+                             'Example: --network-interfaces "eth0,eth1".')
+
+    # once deprecated use of --network-interface is removed, replace action=NicAction with action='append'
+    parser.add_argument('--network-interface', action=make_nic_action(deprecated=True), dest='nics',
+                        help='Network interface that can be used for communication. Use multiple times '
+                             'to configure multiple interfaces. If not specified, Horovod will find the'
+                             'common NICs among all the workers. Also see --network-interfaces. '
+                             'Example: --network-interface eth0 --network-interface eth1')
 
     parser.add_argument('--output-filename', action='store',
                         help='For Gloo, writes stdout / stderr of all processes to a filename of the form '
@@ -339,6 +391,19 @@ def parse_args():
                                               action=make_override_false_action(override_args),
                                               help='Explicitly disable hierarchical allgather to prevent autotuning '
                                                    'from adjusting it.')
+    
+    group_torus_allreduce = group_params.add_mutually_exclusive_group()
+    group_torus_allreduce.add_argument('--torus-allreduce',
+                                              action=make_override_true_action(override_args),
+                                              help='Perform 2D NCCL torus allreduce between workers instead of '
+                                                   'ring allreduce. Torus allreduce is the same as hierarchical allreduce '
+                                                   'but the parallel inter-node allreduce is performed using NCCL in place '
+                                                   'of MPI. For each NCCL allreduce operation, NCCL on its own might choose '
+                                                   'between Ring and Tree algorithm.')
+    group_torus_allreduce.add_argument('--no-torus-allreduce', dest='torus_allreduce',
+                                              action=make_override_false_action(override_args),
+                                              help='Explicitly disable torus allreduce to prevent autotuning '
+                                                   'from adjusting it.')
 
     group_autotune = parser.add_argument_group('autotune arguments')
     group_autotune_enabled = group_autotune.add_mutually_exclusive_group()
@@ -373,11 +438,11 @@ def parse_args():
                                      '(default: 0.8')
 
     group_elastic = parser.add_argument_group('elastic arguments')
-    group_elastic.add_argument('--min-np', action='store', dest='min_np', type=int,
+    group_elastic.add_argument('--min-np', '--min-num-proc', action='store', dest='min_num_proc', type=int,
                                help='Minimum number of processes running for training to continue. If number of '
                                     'available processes dips below this threshold, then training will wait for '
                                     'more instances to become available. Defaults to --num-proc.')
-    group_elastic.add_argument('--max-np', action='store', dest='max_np', type=int,
+    group_elastic.add_argument('--max-np', '--max-num-proc', action='store', dest='max_num_proc', type=int,
                                help='Maximum number of training processes, beyond which no additional '
                                     'processes will be created. If not specified, then will be unbounded.')
     group_elastic.add_argument('--slots-per-host', action='store', dest='slots', type=int,
@@ -392,6 +457,9 @@ def parse_args():
     group_elastic.add_argument('--reset-limit', action='store', dest='reset_limit', type=int,
                                help='Maximum number of times that the training job can scale up or down '
                                     'the number of workers after which the job is terminated. (default: None)')
+    group_elastic.add_argument('--blacklist-cooldown-range', action='store', dest='cooldown_range', type=int, nargs=2,
+                               help='Range of seconds (min, max) a failing host will remain in blacklist.'
+                                    'Example: --blacklist-cooldown-range 60 300 (default: None)')
 
     group_timeline = parser.add_argument_group('timeline arguments')
     group_timeline.add_argument('--timeline-filename', action=make_override_action(override_args),
@@ -456,23 +524,23 @@ def parse_args():
                                choices=config_parser.LOG_LEVELS,
                                help='Minimum level to log to stderr from the Horovod backend. (default: WARNING).')
     group_logging_timestamp = group_logging.add_mutually_exclusive_group()
-    group_logging_timestamp.add_argument('--log-with-timestamp', 
+    group_logging_timestamp.add_argument('--log-with-timestamp',
                                          action=make_override_true_action(override_args),
                                          help=argparse.SUPPRESS)
     group_logging_timestamp.add_argument('--log-without-timestamp', dest='log_with_timestamp',
-                                         action=make_override_false_action(override_args), 
+                                         action=make_override_false_action(override_args),
                                          help='Hide the timestamp from Horovod internal log messages.')
     group_logging_timestamp.add_argument('-prefix-timestamp', '--prefix-output-with-timestamp', action='store_true',
                                          dest='prefix_output_with_timestamp',
                                          help='Timestamp each line of output to stdout, stderr, and stddiag.')
-    group_logging_timestamp.add_argument('--log-hide-timestamp', 
+    group_logging_timestamp.add_argument('--log-hide-timestamp',
                                          dest='log_with_timestamp',
-                                         action=make_deprecated_bool_action(override_args, False, '--log-without-timestamp'),
+                                         action=make_deprecated_bool_action(override_args, False, '--log-without-timestamp', 'v0.21.0'),
                                          help=argparse.SUPPRESS)
-    group_logging_timestamp.add_argument('--no-log-hide-timestamp', 
+    group_logging_timestamp.add_argument('--no-log-hide-timestamp',
                                          dest='log_with_timestamp',
-                                         action=make_deprecated_bool_action(override_args, True, '--log-with-timestamp'),
-                                         help=argparse.SUPPRESS)                                     
+                                         action=make_deprecated_bool_action(override_args, True, '--log-with-timestamp', 'v0.21.0'),
+                                         help=argparse.SUPPRESS)
 
     group_hosts_parent = parser.add_argument_group('host arguments')
     group_hosts = group_hosts_parent.add_mutually_exclusive_group()
@@ -546,7 +614,7 @@ def _run_static(args):
                                      binding_args=args.binding_args,
                                      key=secret.make_secret_key(),
                                      start_timeout=tmout,
-                                     num_proc=args.np,
+                                     num_proc=args.num_proc,
                                      hosts=args.hosts,
                                      output_filename=args.output_filename,
                                      run_func_mode=args.run_func is not None,
@@ -559,8 +627,8 @@ def _run_static(args):
     fn_cache = None
     if not args.disable_cache:
         params = ''
-        if args.np:
-            params += str(args.np) + ' '
+        if args.num_proc:
+            params += str(args.num_proc) + ' '
         if args.hosts:
             params += str(args.hosts) + ' '
         if args.ssh_port:
@@ -604,9 +672,9 @@ def _run_static(args):
 
         try:
             _launch_job(args, settings, nics, command)
-            results = [None] * args.np
+            results = [None] * args.num_proc
             # TODO: make it parallel to improve performance
-            for i in range(args.np):
+            for i in range(args.num_proc):
                 results[i] = read_data_from_kvstore(driver_ip, run_func_server_port,
                                                     'runfunc_result', str(i))
             return results
@@ -643,11 +711,12 @@ def _run_elastic(args):
                                     'may need to increase the --start-timeout '
                                     'parameter if you have too many servers.')
     settings = elastic_settings.ElasticSettings(discovery=discover_hosts,
-                                                min_np=args.min_np or args.np,
-                                                max_np=args.max_np,
+                                                min_num_proc=args.min_num_proc or args.num_proc,
+                                                max_num_proc=args.max_num_proc,
                                                 elastic_timeout=args.elastic_timeout,
                                                 reset_limit=args.reset_limit,
-                                                num_proc=args.np,
+                                                cooldown_range=args.cooldown_range,
+                                                num_proc=args.num_proc,
                                                 verbose=2 if args.verbose else 0,
                                                 ssh_port=args.ssh_port,
                                                 ssh_identity_file=args.ssh_identity_file,
@@ -665,7 +734,8 @@ def _run_elastic(args):
 
     env = os.environ.copy()
     config_parser.set_env_from_args(env, args)
-    gloo_run_elastic(settings, env, args.command)
+    executable = args.executable or sys.executable
+    return gloo_run_elastic(settings, env, args.run_func if args.run_func else args.command, executable)
 
 
 def is_gloo_used(use_gloo=None, use_mpi=None, use_jsrun=None):
@@ -710,7 +780,7 @@ def run_controller(use_gloo, gloo_run, use_mpi, mpi_run, use_jsrun, js_run, verb
 
 
 def _is_elastic(args):
-    return args.host_discovery_script is not None or args.min_np is not None
+    return args.host_discovery_script is not None or args.min_num_proc is not None
 
 
 def _launch_job(args, settings, nics, command):
@@ -736,10 +806,10 @@ def _launch_job(args, settings, nics, command):
 def _run(args):
     # If LSF is used, use default values from job config
     if lsf.LSFUtils.using_lsf():
-        if not args.np:
-            args.np = lsf.LSFUtils.get_num_processes()
+        if not args.num_proc:
+            args.num_proc = lsf.LSFUtils.get_num_processes()
         if not args.hosts and not args.hostfile and not args.host_discovery_script:
-            args.hosts = ','.join('{host}:{np}'.format(host=host, np=lsf.LSFUtils.get_num_gpus())
+            args.hosts = ','.join(f'{host}:{lsf.LSFUtils.get_num_gpus()}'
                                   for host in lsf.LSFUtils.get_compute_hosts())
 
     # if hosts are not specified, either parse from hostfile, or default as
@@ -749,10 +819,7 @@ def _run(args):
             args.hosts = hosts.parse_host_files(args.hostfile)
         else:
             # Set hosts to localhost if not specified
-            args.hosts = 'localhost:{np}'.format(np=args.np)
-
-    # Convert nics into set
-    args.nics = set(args.nics.split(',')) if args.nics else None
+            args.hosts = f'localhost:{args.num_proc}'
 
     if _is_elastic(args):
         return _run_elastic(args)
